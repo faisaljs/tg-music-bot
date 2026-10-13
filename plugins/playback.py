@@ -245,6 +245,8 @@ async def play_handler_func(client, message):
     # the other sees True and is routed to the enqueue branch. Closes the race
     # where both could read "not active" and both try to join/play.
     is_active = not await state.activate(target_chat_id)
+    if is_active and target_chat_id not in state.playing and not state.queues.get(target_chat_id):
+        is_active = False
 
     # Force-play interrupts/skips the active stream, so require admin/auth or current song owner.
     if force_play and is_active:

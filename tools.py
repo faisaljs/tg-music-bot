@@ -42,11 +42,14 @@ from utils.rich_ui import (
 from thumbnails import get_thumb
 
 
-async def get_stream_url(youtube_url: str, mode: str = "audio"):
+async def get_stream_url(youtube_url: str, mode: str = "audio", skip_api: bool = False):
     """Direct stream URL for a YouTube link. Non-YouTube URLs are returned as-is.
 
     Delegates to youtube.get_stream / get_video_stream, the multi-tier extraction
     pipeline: Innertube -> ytube API -> yt-dlp fallback (with mem+disk cache).
+
+    skip_api bypasses the ytube API resolver proxy (and its cache) so the caller
+    gets a direct Innertube/yt-dlp URL — used by the playback-timeout retry.
     """
     youtube_pattern = r'^(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+'
     if not re.match(youtube_pattern, youtube_url):
@@ -55,9 +58,9 @@ async def get_stream_url(youtube_url: str, mode: str = "audio"):
         return youtube_url
 
     if mode == "video":
-        res = await get_video_stream(youtube_url)
+        res = await get_video_stream(youtube_url, skip_api=skip_api)
     else:
-        res = await get_stream(youtube_url)
+        res = await get_stream(youtube_url, skip_api=skip_api)
 
     if res:
         logger.info(f"[DIRECT URL] Resolved {mode} stream URL: {res}")
@@ -963,11 +966,13 @@ async def join_call(message, title, youtube_link, chat, by, duration, mode, thum
                     except Exception as create_err:
                         logger.debug(f"[join_call] Auto-starting voice chat failed in {chat_id}: {create_err}")
             elif is_timeout_err and youtube_link:
-                logger.warning(f"[join_call] Playback stream timed out for {youtube_link}; evicting cache and re-extracting fresh stream URL")
+                logger.warning(f"[join_call] Playback stream timed out for {youtube_link}; re-extracting a direct stream URL (bypassing resolver proxy)")
                 evict_stream_cache(youtube_link, mode=mode)
                 try:
-                    fresh_stream = await get_stream_url(youtube_link, mode=mode)
-                    if fresh_stream and fresh_stream != stream_source:
+                    # skip_api so we route around the (slow/unreachable) ytube resolver
+                    # proxy that just timed out and get a direct Innertube/yt-dlp URL.
+                    fresh_stream = await get_stream_url(youtube_link, mode=mode, skip_api=True)
+                    if fresh_stream:
                         stream_source = fresh_stream
                         logger.info(f"[RETRY PLAYING DIRECT URL] Retrying play with fresh stream URL for chat {chat_id}: {stream_source}")
                         print(f"[RETRY PLAYING DIRECT URL] Assistant {ast_num} retrying -> {stream_source}", flush=True)
@@ -983,12 +988,34 @@ async def join_call(message, title, youtube_link, chat, by, duration, mode, thum
                         retried = True
                 except Exception as retry_err:
                     logger.warning(f"[join_call] Retry play with fresh stream URL failed in {chat_id}: {retry_err}")
+            elif is_timeout_err:
+                # No youtube_link to re-extract from (pure direct URL). A connection
+                # timeout is often transient — retry the same source once.
+                logger.warning(f"[join_call] Playback stream timed out for direct source in {chat_id}; retrying once")
+                try:
+                    await call_py.play(
+                        chat_id,
+                        MediaStream(
+                            stream_source,
+                            AudioQuality.STUDIO,
+                            VideoQuality.HD_720p,
+                            video_flags=audio_flags,
+                        ),
+                    )
+                    retried = True
+                except Exception as retry_err:
+                    logger.warning(f"[join_call] Direct-source retry failed in {chat_id}: {retry_err}")
 
             if not retried:
                 raise play_err
 
         _jc_call_ms = (time.perf_counter() - _jc_t0) * 1000
         logger.info(f"[join_call] ⏱ call_py.play() took {_jc_call_ms:.1f}ms for chat {chat_id} (Assistant {ast_num})")
+
+        try:
+            await call_py.resume(chat_id)
+        except Exception:
+            pass
 
 
         # Mark chat active with this assistant
@@ -1271,7 +1298,14 @@ async def _trigger_suggestions(client, chat_id: int, last_song: dict):
     Fetches suggestions related to the last played track and posts an interactive
     suggestion card with a 10-second countdown to autoplay the top result.
     """
+    call_py = get_call_client(chat_id) or (client if hasattr(client, "leave_call") else clients.get("call_py"))
     try:
+        if call_py:
+            try:
+                await call_py.pause(chat_id)
+            except Exception:
+                pass
+
         last_vid = None
         yt_link = last_song.get("yt_link", "")
 
@@ -1283,7 +1317,11 @@ async def _trigger_suggestions(client, chat_id: int, last_song: dict):
         if not last_vid:
             logger.info(f"[Suggest] No video_id extractable for chat {chat_id} from {yt_link}; leaving call.")
             await state.delete_now_playing(chat_id)
-            await client.leave_call(chat_id)
+            if call_py:
+                try:
+                    await call_py.leave_call(chat_id)
+                except Exception:
+                    pass
             await remove_active_chat(chat_id)
             return
 
@@ -1295,7 +1333,11 @@ async def _trigger_suggestions(client, chat_id: int, last_song: dict):
         if not suggestions:
             logger.info(f"[Suggest] No related suggestions found for {last_vid} in chat {chat_id}; leaving call.")
             await state.delete_now_playing(chat_id)
-            await client.leave_call(chat_id)
+            if call_py:
+                try:
+                    await call_py.leave_call(chat_id)
+                except Exception:
+                    pass
             await remove_active_chat(chat_id)
             return
 
@@ -1307,7 +1349,11 @@ async def _trigger_suggestions(client, chat_id: int, last_song: dict):
         bot = clients.get("bot")
         if not bot:
             logger.warning("[Suggest] Bot client not available")
-            await client.leave_call(chat_id)
+            if call_py:
+                try:
+                    await call_py.leave_call(chat_id)
+                except Exception:
+                    pass
             await remove_active_chat(chat_id)
             return
 
@@ -1506,7 +1552,11 @@ async def _trigger_suggestions(client, chat_id: int, last_song: dict):
                 logger.debug(f"[Suggest] Countdown autoplay cancelled for chat {chat_id}")
             except Exception as err:
                 logger.warning(f"[Suggest] Countdown autoplay failed for chat {chat_id}: {err}")
-                await client.leave_call(chat_id)
+                if call_py:
+                    try:
+                        await call_py.leave_call(chat_id)
+                    except Exception:
+                        pass
                 await remove_active_chat(chat_id)
             finally:
                 state.suggest_tasks.pop(chat_id, None)
@@ -1517,7 +1567,8 @@ async def _trigger_suggestions(client, chat_id: int, last_song: dict):
     except Exception as e:
         logger.warning(f"[Suggest] Error triggering suggestions for chat {chat_id}: {e}")
         try:
-            await client.leave_call(chat_id)
+            if call_py:
+                await call_py.leave_call(chat_id)
             await remove_active_chat(chat_id)
         except Exception as cleanup_err:
             logger.debug(f"[Suggest] Cleanup after the suggestion failure failed for chat {chat_id}: {cleanup_err}")

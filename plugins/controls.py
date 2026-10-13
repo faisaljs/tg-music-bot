@@ -368,6 +368,7 @@ async def button_skip_handler(client: Client, callback_query: CallbackQuery):
         chat_id = await _resolve_ctrl_chat_id(client, callback_query, is_channel)
         active_cp = get_call_client(chat_id) or clients.get("call_py")
 
+        state.cancel_suggest(chat_id)
         if chat_id in state.queues and len(state.queues[chat_id]) > 0:
             # There's a next song in queue
             next_song = state.queues[chat_id].pop(0)
@@ -400,9 +401,15 @@ async def button_skip_handler(client: Client, callback_query: CallbackQuery):
                 last_song = state.playing.pop(chat_id, None) or state.last_played.get(chat_id)
                 if last_song:
                     state.last_played[chat_id] = last_song
+                    try:
+                        if active_cp:
+                            await active_cp.pause(chat_id)
+                    except Exception as e:
+                        logger.warning(f"Could not pause before skip: {e}")
                     await callback_query.answer(Messages.SKIPPED_AUTOPLAY, show_alert=False)
+                    await state.delete_now_playing(chat_id)
                     # Fire and forget — trigger_suggestions will send the card and start countdown
-                    asyncio.create_task(trigger_suggestions(client, chat_id, last_song))
+                    asyncio.create_task(trigger_suggestions(active_cp or client, chat_id, last_song))
                     return
             try:
                 if active_cp:
@@ -614,6 +621,7 @@ async def skip_handler_func(client, message):
    is_channel = message.command[0].lower() == "cskip"
    chat_id = await _resolve_ctrl_chat_id(client, message, is_channel)
    active_cp = get_call_client(chat_id) or clients.get("call_py")
+   state.cancel_suggest(chat_id)
    if chat_id in state.queues and len(state.queues[chat_id]) > 0:
        next = state.queues[chat_id].pop(0)
        await rich_reply(
@@ -654,13 +662,19 @@ async def skip_handler_func(client, message):
             last_song = state.playing.pop(chat_id, None) or state.last_played.get(chat_id)
             if last_song:
                 state.last_played[chat_id] = last_song
+                try:
+                    if active_cp:
+                        await active_cp.pause(chat_id)
+                except Exception as e:
+                    logger.warning(f"Could not pause before skip: {e}")
+                await state.delete_now_playing(chat_id)
                 await rich_reply(
                     message,
                     rich_note(Messages.SKIPPED_AUTOPLAY),
                     client=client,
                 )
                 # Fire and forget — trigger_suggestions will send the card and start countdown
-                asyncio.create_task(trigger_suggestions(client, chat_id, last_song))
+                asyncio.create_task(trigger_suggestions(active_cp or client, chat_id, last_song))
                 return
 
         if active_cp:
@@ -693,7 +707,7 @@ async def button_resume_handler(client: Client, callback_query: CallbackQuery):
         chat_id = await _resolve_ctrl_chat_id(client, callback_query, is_channel)
         active_cp = get_call_client(chat_id) or clients.get("call_py")
 
-        if await is_active_chat(client, chat_id):
+        if await is_active_chat(client, chat_id) and chat_id in state.playing:
             if active_cp:
                 await active_cp.resume(chat_id)
             await callback_query.answer(clean_alert(Messages.RESUMED.format(callback_query.from_user.first_name or "User")), show_alert=False)
@@ -716,7 +730,7 @@ async def button_pause_handler(client: Client, callback_query: CallbackQuery):
         chat_id = await _resolve_ctrl_chat_id(client, callback_query, is_channel)
         active_cp = get_call_client(chat_id) or clients.get("call_py")
 
-        if await is_active_chat(client, chat_id):
+        if await is_active_chat(client, chat_id) and chat_id in state.playing:
             if active_cp:
                 await active_cp.pause(chat_id)
             await callback_query.answer(clean_alert(Messages.PAUSED.format(callback_query.from_user.first_name or "User")), show_alert=False)
@@ -736,7 +750,7 @@ async def resume_handler_func(client, message):
    is_channel = message.command[0].lower() == "cresume"
    chat_id = await _resolve_ctrl_chat_id(client, message, is_channel)
    active_cp = get_call_client(chat_id) or clients.get("call_py")
-   if await is_active_chat(client, chat_id):
+   if await is_active_chat(client, chat_id) and chat_id in state.playing:
        if active_cp:
            await active_cp.resume(chat_id)
        await rich_reply(message, rich_note(Messages.RESUMED.format(message.from_user.mention())), client=client)
@@ -756,7 +770,7 @@ async def pause_handler_func(client, message):
    is_channel = message.command[0].lower() == "cpause"
    chat_id = await _resolve_ctrl_chat_id(client, message, is_channel)
    active_cp = get_call_client(chat_id) or clients.get("call_py")
-   if await is_active_chat(client, chat_id):
+   if await is_active_chat(client, chat_id) and chat_id in state.playing:
        if active_cp:
            await active_cp.pause(chat_id)
        await rich_reply(message, rich_note(Messages.PAUSED.format(message.from_user.mention())), client=client)

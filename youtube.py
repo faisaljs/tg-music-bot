@@ -651,20 +651,24 @@ async def resolve_innertube(argument: str, mode: str = "audio") -> dict | None:
         return None
 
 
-async def get_stream(url: str, cookies: str | None = None) -> str | None:
-    logger.info(f"[AUDIO] get_stream called: {url}")
-    cached = _mem_cache_get(("audio", url))
-    if cached:
-        logger.info(f"[AUDIO] MEM_CACHE hit for {url[:80]}")
-        return cached
-    cached = await _read_cache(url, prefix="audio_")
-    if cached:
-        _mem_cache_set(("audio", url), cached)
-        return cached
+async def get_stream(url: str, cookies: str | None = None, skip_api: bool = False) -> str | None:
+    logger.info(f"[AUDIO] get_stream called: {url} (skip_api={skip_api})")
+    # skip_api bypasses the cache + ytube API resolver proxy and resolves a direct
+    # stream URL (Innertube/yt-dlp). Used by the playback-timeout retry so a slow or
+    # unreachable resolver proxy does not keep returning the same unplayable URL.
+    if not skip_api:
+        cached = _mem_cache_get(("audio", url))
+        if cached:
+            logger.info(f"[AUDIO] MEM_CACHE hit for {url[:80]}")
+            return cached
+        cached = await _read_cache(url, prefix="audio_")
+        if cached:
+            _mem_cache_set(("audio", url), cached)
+            return cached
     logger.info("[AUDIO] No cache, extracting fresh stream...")
 
     # Fast Path 1: ytube API (/info) if configured and breaker is closed
-    if API_TOKEN and BASE_URL and not _api_breaker_open():
+    if API_TOKEN and BASE_URL and not _api_breaker_open() and not skip_api:
         try:
             api_url = f"{BASE_URL}/info?q={url}&token={API_TOKEN}"
             logger.info(f"[API CALL] ytube audio API -> {api_url}")
@@ -714,20 +718,21 @@ async def get_stream(url: str, cookies: str | None = None) -> str | None:
         logger.warning(f"[AUDIO] Extraction returned None for {url}")
     return stream
 
-async def get_video_stream(url: str, cookies: str | None = None) -> str | None:
-    logger.info(f"[VIDEO] get_video_stream called: {url}")
-    cached = _mem_cache_get(("video", url))
-    if cached:
-        logger.info(f"[VIDEO] MEM_CACHE hit for {url[:80]}")
-        return cached
-    cached = await _read_cache(url, prefix="video_")
-    if cached:
-        _mem_cache_set(("video", url), cached)
-        return cached
+async def get_video_stream(url: str, cookies: str | None = None, skip_api: bool = False) -> str | None:
+    logger.info(f"[VIDEO] get_video_stream called: {url} (skip_api={skip_api})")
+    if not skip_api:
+        cached = _mem_cache_get(("video", url))
+        if cached:
+            logger.info(f"[VIDEO] MEM_CACHE hit for {url[:80]}")
+            return cached
+        cached = await _read_cache(url, prefix="video_")
+        if cached:
+            _mem_cache_set(("video", url), cached)
+            return cached
     logger.info("[VIDEO] No cache, extracting fresh stream...")
 
     # Fast Path 1: ytube API (/info) if configured and breaker is closed
-    if API_TOKEN and BASE_URL and not _api_breaker_open():
+    if API_TOKEN and BASE_URL and not _api_breaker_open() and not skip_api:
         try:
             api_url = f"{BASE_URL}/info?q={url}&token={API_TOKEN}"
             logger.info(f"[API CALL] ytube video API -> {api_url}")
