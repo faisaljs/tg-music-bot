@@ -22,6 +22,8 @@ class SessionStore:
         self.queues = {}     # chat_id -> list[QueueEntry]
         self.playing = {}    # chat_id -> QueueEntry | dict
         self.played = {}     # chat_id -> int (unix ts playback started)
+        self.paused_at = {}  # chat_id -> float (unix ts when playback was paused)
+        self.stalled_skips = set()  # chats currently being auto-skipped after a stalled stream
         self.active = set()  # chat_ids with an active voice chat
         self.suggest_tasks = {}      # chat_id -> asyncio.Task (active countdown task)
         self.last_played = {}        # chat_id -> dict (last played track info)
@@ -107,6 +109,29 @@ class SessionStore:
         """Set autoplay preference for chat_id."""
         self.autoplay_settings[chat_id] = enabled
 
+    def mark_paused(self, chat_id: int):
+        """Freeze elapsed playback time until the matching resume."""
+        cid = int(chat_id)
+        if cid in self.played and cid not in self.paused_at:
+            self.paused_at[cid] = time.time()
+
+    def mark_resumed(self, chat_id: int):
+        """Exclude the paused interval from elapsed playback time."""
+        cid = int(chat_id)
+        paused_at = self.paused_at.pop(cid, None)
+        if paused_at is not None and cid in self.played:
+            self.played[cid] += int(time.time() - paused_at)
+
+    def is_paused(self, chat_id: int) -> bool:
+        return int(chat_id) in self.paused_at
+
+    def elapsed_playback(self, chat_id: int) -> int:
+        """Return playback seconds excluding any current paused interval."""
+        cid = int(chat_id)
+        started_at = self.played[cid]
+        end = self.paused_at.get(cid, time.time())
+        return max(0, int(end - started_at))
+
     def add_to_history(self, chat_id, video_id: str):
         """Record a played/suggested video ID in recent history for chat_id to prevent recommendation loops."""
         if video_id and isinstance(video_id, str):
@@ -162,6 +187,8 @@ class SessionStore:
         async with self.lock(cid):
             self.active.discard(cid)
             self.active.discard(chat_id)
+            self.paused_at.pop(cid, None)
+            self.stalled_skips.discard(cid)
             self.chat_assistants.pop(cid, None)
             for ast_set in self.assistant_active.values():
                 ast_set.discard(cid)
@@ -181,4 +208,3 @@ class SessionStore:
 
 
 state = SessionStore()
-

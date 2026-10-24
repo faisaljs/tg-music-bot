@@ -313,6 +313,70 @@ async def remove_active_chat(chat_id):
     clear_directory(chat_dir)
 
 
+STREAM_END_GRACE_SECONDS = 20
+
+
+async def auto_skip_stalled_track(chat_id: int, duration_seconds: int) -> bool:
+    """Advance a track whose stream outlived its declared duration.
+
+    This is intentionally separate from the user-facing skip handlers: the
+    progress task has no Telegram callback to authorize, answer, or edit.
+    """
+    chat_id = int(chat_id)
+    if chat_id in state.stalled_skips:
+        return False
+    state.stalled_skips.add(chat_id)
+    try:
+        current_song = state.playing.get(chat_id)
+        if not current_song or state.is_paused(chat_id):
+            return False
+        if state.elapsed_playback(chat_id) <= duration_seconds + STREAM_END_GRACE_SECONDS:
+            return False
+
+        active_cp = get_call_client(chat_id) or clients.get("call_py")
+        next_song = (state.queues.get(chat_id) or [None]).pop(0)
+        if next_song:
+            try:
+                if active_cp:
+                    await active_cp.pause(chat_id)
+            except Exception as exc:
+                logger.warning("[auto_skip] Could not pause stalled stream in %s: %s", chat_id, exc)
+            await state.delete_now_playing(chat_id)
+            await join_call(
+                next_song["message"],
+                next_song["title"],
+                next_song["yt_link"],
+                next_song["chat"],
+                next_song["by"],
+                next_song["duration"],
+                next_song["mode"],
+                next_song["thumb"],
+                next_song.get("stream_url"),
+                yt_task=next_song.get("_yt_task"),
+                queue_msg=next_song.get("queue_msg"),
+                assistant_num=state.get_chat_assistant(chat_id),
+            )
+            logger.warning("[auto_skip] Advanced stalled track in chat %s", chat_id)
+            return True
+
+        try:
+            if active_cp:
+                await active_cp.leave_call(chat_id)
+        except Exception as exc:
+            logger.warning("[auto_skip] Could not leave stalled call in %s: %s", chat_id, exc)
+        await remove_active_chat(chat_id)
+        state.queues.pop(chat_id, None)
+        state.playing.pop(chat_id, None)
+        await state.delete_now_playing(chat_id)
+        logger.warning("[auto_skip] Cleared stalled track in chat %s", chat_id)
+        return True
+    except Exception:
+        logger.exception("[auto_skip] Failed to handle stalled track in chat %s", chat_id)
+        return False
+    finally:
+        state.stalled_skips.discard(chat_id)
+
+
 async def update_progress_button(message, duration_str, chat, markup):
     try:
         if not duration_str or duration_str in ("N/A", "Live", "0:00", "00:00") or ":" not in duration_str:
@@ -324,7 +388,7 @@ async def update_progress_button(message, duration_str, chat, markup):
         while True:
             # Check elapsed time from pytgcalls
             try:
-                elapsed_seconds = int(time.time() - state.played[chat.id])
+                elapsed_seconds = state.elapsed_playback(chat.id)
             except Exception:
                 break  # Song ended or chat removed
 
@@ -335,6 +399,14 @@ async def update_progress_button(message, duration_str, chat, markup):
                     break
             except Exception as e:
                 logger.debug(f"[update_progress_button] Song-change check failed for chat {chat.id}: {e}")
+
+            if state.is_paused(chat.id):
+                await asyncio.sleep(1)
+                continue
+
+            if elapsed_seconds > total_seconds + STREAM_END_GRACE_SECONDS:
+                await auto_skip_stalled_track(chat.id, total_seconds)
+                break
 
             elapsed_str = time.strftime('%M:%S', time.gmtime(elapsed_seconds))
 
@@ -1035,6 +1107,7 @@ async def join_call(message, title, youtube_link, chat, by, duration, mode, thum
             "assistant_num": ast_num,
             "ui_chat_id": ui_chat_id,
         }
+        state.paused_at.pop(chat_id, None)
         state.played[chat_id] = int(time.time())
         state.last_played[chat_id] = state.playing[chat_id]
         # Persist alongside the in-memory value: the auto-leave sweep needs to

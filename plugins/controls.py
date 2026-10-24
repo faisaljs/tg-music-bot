@@ -710,6 +710,7 @@ async def button_resume_handler(client: Client, callback_query: CallbackQuery):
         if await is_active_chat(client, chat_id) and chat_id in state.playing:
             if active_cp:
                 await active_cp.resume(chat_id)
+            state.mark_resumed(chat_id)
             await callback_query.answer(clean_alert(Messages.RESUMED.format(callback_query.from_user.first_name or "User")), show_alert=False)
         else:
             await callback_query.answer(Messages.ASSISTANT_NOT_STREAMING, show_alert=True)
@@ -733,6 +734,7 @@ async def button_pause_handler(client: Client, callback_query: CallbackQuery):
         if await is_active_chat(client, chat_id) and chat_id in state.playing:
             if active_cp:
                 await active_cp.pause(chat_id)
+            state.mark_paused(chat_id)
             await callback_query.answer(clean_alert(Messages.PAUSED.format(callback_query.from_user.first_name or "User")), show_alert=False)
         else:
             await callback_query.answer(Messages.ASSISTANT_NOT_STREAMING, show_alert=True)
@@ -753,6 +755,7 @@ async def resume_handler_func(client, message):
    if await is_active_chat(client, chat_id) and chat_id in state.playing:
        if active_cp:
            await active_cp.resume(chat_id)
+       state.mark_resumed(chat_id)
        await rich_reply(message, rich_note(Messages.RESUMED.format(message.from_user.mention())), client=client)
    else:
        await rich_reply(message, rich_note(Messages.NO_STREAM), ephemeral=True, client=client)
@@ -773,6 +776,7 @@ async def pause_handler_func(client, message):
    if await is_active_chat(client, chat_id) and chat_id in state.playing:
        if active_cp:
            await active_cp.pause(chat_id)
+       state.mark_paused(chat_id)
        await rich_reply(message, rich_note(Messages.PAUSED.format(message.from_user.mention())), client=client)
    else:
        await rich_reply(message, rich_note(Messages.NO_STREAM), ephemeral=True, client=client)
@@ -1031,4 +1035,3 @@ async def stats_period_handler(client: Client, callback_query: CallbackQuery):
         stats_cards_put(message.chat.id, message.id, cards)
 
     await rich_edit(callback_query, cards[period], reply_markup=Buttons.stats_markup(period))
-
