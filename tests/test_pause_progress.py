@@ -104,6 +104,7 @@ async def test_progress_updater_auto_skips_stalled_track():
 @pytest.mark.asyncio
 async def test_stalled_track_ends_when_queue_is_empty():
     chat_id = -1001234567893
+    generation = state.generation(chat_id)
     state.played[chat_id] = time.time() - 81
     state.playing[chat_id] = {"duration": "1:00"}
     active_cp = MagicMock()
@@ -114,6 +115,6 @@ async def test_stalled_track_ends_when_queue_is_empty():
         assert await auto_skip_stalled_track(chat_id, 60)
 
     active_cp.leave_call.assert_awaited_once_with(chat_id)
-    remove_active.assert_awaited_once_with(chat_id)
+    remove_active.assert_awaited_once_with(chat_id, generation=generation)
     assert chat_id not in state.playing
     state.played.pop(chat_id, None)

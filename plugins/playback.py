@@ -17,7 +17,7 @@ def _bg(coro):
     return task
 
 
-async def dend(client, update, channel_id= None):
+async def dend(client, update, channel_id=None, *, generation=None):
     # Enhanced input validation
     try:
         chat_id = int(channel_id or update.chat.id)
@@ -27,9 +27,18 @@ async def dend(client, update, channel_id= None):
         return
     try:
         chat_id = int(channel_id or update.chat.id)  # Ensure integer chat_id
-        if chat_id in state.queues and state.queues[chat_id]:
-            next_song = state.queues[chat_id].pop(0)
-            state.playing[chat_id] = next_song
+        generation = state.generation(chat_id) if generation is None else generation
+        async with state.lock(chat_id):
+            if not state.is_current(chat_id, generation):
+                return
+            queue = state.queues.get(chat_id)
+            next_song = queue.pop(0) if queue else None
+            if next_song:
+                state.playing[chat_id] = next_song
+            else:
+                state.queues.pop(chat_id, None)
+                state.playing.pop(chat_id, None)
+        if next_song:
             await join_call(
                 next_song['message'],
                 next_song['title'],
@@ -43,19 +52,20 @@ async def dend(client, update, channel_id= None):
                 yt_task=next_song.get('_yt_task'),
                 queue_msg=next_song.get('queue_msg'),
                 assistant_num=state.get_chat_assistant(chat_id),
+                generation=generation,
             )
         else:
             logger.info(f"Song queue for chat {chat_id} is empty.")
-            await state.delete_now_playing(chat_id)
-            call_py = get_call_client(chat_id)
-            if call_py:
-                try:
-                    await call_py.leave_call(chat_id)
-                except Exception as e:
-                    logger.debug(f"[dend] Failed to leave call for empty queue in {chat_id}: {e}")
-            await remove_active_chat(client, chat_id)
-            state.queues.pop(chat_id, None)
-            state.playing.pop(chat_id, None)
+            async with state.playback_lock(chat_id):
+                if not state.is_current(chat_id, generation):
+                    return
+                call_py = get_call_client(chat_id)
+                if call_py:
+                    try:
+                        await call_py.leave_call(chat_id)
+                    except Exception as e:
+                        logger.debug(f"[dend] Failed to leave call for empty queue in {chat_id}: {e}")
+                await remove_active_chat(client, chat_id, generation=generation)
     except Exception as e:
         logger.error(f"Error in dend function: {e}")
 
@@ -86,7 +96,7 @@ async def download_media_with_progress(client, msg, media_msg, type_of):
             progress_args=(client, msg, type_of, filename, start_time))
         return file_path
     except Exception as e:
-        print(f"Download error: {e}")
+        logger.warning("Download error: %s", e)
         return None
 
 
@@ -129,10 +139,10 @@ async def progress_bar(current, total, client, msg, type_of, filename, start_tim
               if random.choices([True, False], weights=[1, 20])[0]:
                 await rich_edit(msg, progress_message, client=client)
             except Exception as e:
-                print(f"Progress update error: {e}")
+                logger.debug("Progress update error: %s", e)
 
     except Exception as e:
-        print(f"Progress bar error: {e}")
+        logger.debug("Progress bar error: %s", e)
 
 
 def with_opencv(filename):
@@ -199,10 +209,8 @@ async def play_handler_func(client, message):
 
     if raw_query:
         logger.info(f"[PLAY COMMAND] Received query/URL: {raw_query}")
-        print(f"[PLAY COMMAND] Received query/URL: {raw_query}", flush=True)
         if is_direct_stream_url(raw_query):
             logger.info(f"[DIRECT URL] User input is a direct stream URL: {raw_query}")
-            print(f"[DIRECT URL] User input is a direct stream URL: {raw_query}", flush=True)
 
     if not has_media and not raw_query:
         await rich_reply(
@@ -235,396 +243,434 @@ async def play_handler_func(client, message):
             return
         target_chat_id = linked_chat.id
 
-    # Check queue for the target chat
-    _current_queue = len(state.queues.get(target_chat_id, [])) if state.queues else 0
+    request_generation = state.generation(target_chat_id)
+    async with state.request_lock(target_chat_id):
+        if not state.is_current(target_chat_id, request_generation):
+            return
+        # Check queue for the target chat
+        _current_queue = len(state.queues.get(target_chat_id, [])) if state.queues else 0
 
-    massage = await message.reply(Messages.BOLT, link_preview_options=None)
-    state.cancel_suggest(target_chat_id)
-    # Atomic test-and-set under the per-chat lock: of two near-simultaneous /play
-    # calls in the same chat, exactly one sees is_active=False (starts playback);
-    # the other sees True and is routed to the enqueue branch. Closes the race
-    # where both could read "not active" and both try to join/play.
-    is_active = not await state.activate(target_chat_id)
-    if is_active and target_chat_id not in state.playing and not state.queues.get(target_chat_id):
-        is_active = False
-
-    # Force-play interrupts/skips the active stream, so require admin/auth or current song owner.
-    if force_play and is_active:
-        current_song = state.playing.get(target_chat_id)
-        current_owner_id = (
-            getattr(current_song.get("by"), "id", None)
-            if isinstance(current_song, dict)
-            else None
-        )
-        if current_song and message.from_user.id != current_owner_id and not await is_authorized(
-            client, message.chat.id, message.from_user.id
-        ):
-            await rich_edit(massage, rich_note(Messages.ADMIN_RESTRICTED_CMD), client=client)
+        state.cancel_suggest(target_chat_id)
+        # Preparation is serialized separately from playback and stop. An active
+        # chat with no song/queue is waiting on autoplay and may start immediately.
+        is_active = not await state.activate(target_chat_id, generation=request_generation)
+        if not state.is_current(target_chat_id, request_generation):
+            return
+        generation = request_generation
+        if is_active and target_chat_id not in state.playing and not state.queues.get(target_chat_id):
+            is_active = False
+            # Revoke pending autoplay when resuming an idle active session.
+            # A cold start keeps its generation so commands waiting for their
+            # preparation turn remain valid, including while Telegram replies.
+            generation = state.invalidate(target_chat_id)
+        massage = await message.reply(Messages.BOLT, link_preview_options=None)
+        if not state.is_current(target_chat_id, generation):
             return
 
-    youtube_link = None
-    media_info = {}
-    _yt_task = None
-    _playlist_rest = []
-
-    # Initialize title with a safe default to prevent unbound variable issues
-    title = trim_title("Unknown Media")
-
-    # Check if replied to media message
-    if has_media:
-        media_msg = message.reply_to_message
-        media_type = None
-        duration = 0
-        thumbnail = None
-
-        # Video handling
-        if media_msg.video:
-            media = media_msg.video
-            media_type = "video"
-            title = trim_title(media.file_name or "Telegram Video")
-            duration = media.duration
-            if media.thumbs:
-                thumbnail = await client.download_media(media.thumbs[0].file_id)
-
-        # Audio handling
-        elif media_msg.audio:
-            media = media_msg.audio
-            media_type = "audio"
-            title = trim_title(media.title or "Telegram Audio")
-            duration = media.duration
-            if media.thumbs:
-                thumbnail = await client.download_media(media.thumbs[0].file_id)
-
-        # Voice message handling
-        elif media_msg.voice:
-            media = media_msg.voice
-            media_type = "voice"
-            title = trim_title("Voice Message")
-            duration = media.duration
-
-        # Video note handling
-        elif media_msg.video_note:
-            media = media_msg.video_note
-            media_type = "video_note"
-            title = trim_title("Video Note")
-            duration = media.duration
-            if media.thumbs:
-                thumbnail = await client.download_media(media.thumbs[0].file_id)
-        elif media_msg.document:
-            doc = media_msg.document
-            media = media_msg.document
-            mime = (doc.mime_type or "").lower()
-            if mime.startswith("video/"):
-                media_type = "video"
-                title = trim_title(doc.file_name or "Telegram Video")
-                duration = getattr(doc, 'duration', 0)
-            elif mime.startswith("audio/"):
-                media_type = "audio"
-                title = trim_title(doc.file_name or "Telegram Audio")
-                duration = getattr(doc, 'duration', 0)
-
-
-            if media_type and doc.thumbs:
-                thumbnail = await client.download_media(doc.thumbs[0].file_id,f"{user_dir}/")
-        else:
-            await rich_edit(massage, rich_note(Messages.UNSUPPORTED_MEDIA), client=client)
-            return await remove_active_chat(client, target_chat_id)
-        if not media_type:
-            await rich_edit(massage, rich_note(Messages.UNSUPPORTED_MEDIA), client=client)
-            return await remove_active_chat(client, target_chat_id)
-        # Check Telegram media size against 2 GB limit
-        file_size = getattr(media, "file_size", 0) or 0
-        if file_size > MAX_FILE_SIZE_BYTES:
-            await rich_edit(massage, rich_note(Messages.FILE_TOO_LARGE), client=client)
-            return await remove_active_chat(client, target_chat_id)
-        # For media messages
-        youtube_link = await download_media_with_progress(
-            client,
-            massage,
-            message.reply_to_message,
-            "Media"
-        )
-        stream_url = None
-
-        # Generate thumbnail if missing
-        if not thumbnail and media_type in ["video", "video_note"]:
-            try:
-                thumbnail = await asyncio.to_thread(generate_thumbnail, youtube_link, f'{user_dir}/thumb.png')
-            except Exception as e:
-                print(e)
-                thumbnail = None
-        # Format duration
-        if not duration or duration <=0:
-            duration = await asyncio.to_thread(with_opencv, youtube_link)
-        duration = format_duration(int(duration))
-        media_info = {
-            'title': title,
-            'duration': duration,
-            'thumbnail': thumbnail,
-            'file_id': media.file_id,
-            'media_type': media_type,
-            'url': youtube_link
-        }
-    else:
-        search_query = raw_query
-        # Source seam: a playlist link expands into many per-track queries;
-        # search text or a single video URL stays a one-element list.
-        _sources = await resolve_sources(search_query)
-        first_item = _sources[0]
-        search_query = first_item[0]
-        _playlist_rest = _sources[1:]
-
-        # Placeholder values — join_call will wait for the task to resolve
-        title = trim_title(first_item[1] if len(first_item) > 1 and first_item[1] else search_query[:25])
-        duration = first_item[2] if len(first_item) > 2 and first_item[2] else None
-        youtube_link = None
-        thumbnail = None
-        _channel_name = None
-        _views = None
-        video_id = None
-        stream_url = None
-
-        _yt_task = asyncio.create_task(handle_youtube(search_query))
-        _yt_task.add_done_callback(
-            lambda t: t.exception() if not t.cancelled() else None
-        )
-
-    # Start thumbnail generation in the background so the voice join is not blocked.
-    # join_call will await the task only after streaming is already live.
-    if media_info:
-        thumb = asyncio.create_task(
-            get_thumb(
-                media_info['title'],
-                media_info['duration'],
-                media_info['thumbnail'],
-                None,
-                None,
-                None,
+        # Force-play interrupts/skips the active stream, so require admin/auth or current song owner.
+        if force_play and is_active:
+            current_song = state.playing.get(target_chat_id)
+            current_owner_id = (
+                getattr(current_song.get("by"), "id", None)
+                if isinstance(current_song, dict)
+                else None
             )
-        )
-    else:
-        # join_call will create the thumb task once yt_task resolves
-        thumb = None
-    if thumb:
-        thumb.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+            if current_song and message.from_user.id != current_owner_id and not await is_authorized(
+                client, message.chat.id, message.from_user.id
+            ):
+                await rich_edit(massage, rich_note(Messages.ADMIN_RESTRICTED_CMD), client=client)
+                return
+        if force_play and is_active:
+            generation = state.invalidate(target_chat_id)
 
-    # Set the target chat and ensure assistant has joined the target chat
-    ast_num, ast_session, ast_call_py = await get_assistant(target_chat_id)
-    if not ast_session:
-        ast_session = clients.get("session")
+        youtube_link = None
+        media_info = {}
+        _yt_task = None
+        _playlist_rest = []
 
-    target_chat = None
-    max_retries = get_assistant_count()
-    attempt = 0
+        # Initialize title with a safe default to prevent unbound variable issues
+        title = trim_title("Unknown Media")
 
-    while attempt < max_retries:
-        attempt += 1
-        try:
-            # Fast path: this assistant was recently confirmed to be a member, so
-            # skip the get_chat -> create_chat_invite_link -> join_chat round
-            # trips. Any later failure (kick, ban, left) surfaces on call_py.play
-            # in join_call, which clears the entry so the next /play re-verifies.
-            _fp_chat = linked_chat if channel_mode else message.chat
-            if _fp_chat is not None and state.is_member_cached(ast_num, _fp_chat.id):
-                logger.info(f"[play] Assistant {ast_num} membership cached for {_fp_chat.id}; skipping join handshake")
-                target_chat = _fp_chat
-                break
+        # Check if replied to media message
+        if has_media:
+            media_msg = message.reply_to_message
+            media_type = None
+            duration = 0
+            thumbnail = None
 
-            if channel_mode:
-                target_chat = linked_chat
+            # Video handling
+            if media_msg.video:
+                media = media_msg.video
+                media_type = "video"
+                title = trim_title(media.file_name or "Telegram Video")
+                duration = media.duration
+                if media.thumbs:
+                    thumbnail = await client.download_media(media.thumbs[0].file_id)
+
+            # Audio handling
+            elif media_msg.audio:
+                media = media_msg.audio
+                media_type = "audio"
+                title = trim_title(media.title or "Telegram Audio")
+                duration = media.duration
+                if media.thumbs:
+                    thumbnail = await client.download_media(media.thumbs[0].file_id)
+
+            # Voice message handling
+            elif media_msg.voice:
+                media = media_msg.voice
+                media_type = "voice"
+                title = trim_title("Voice Message")
+                duration = media.duration
+
+            # Video note handling
+            elif media_msg.video_note:
+                media = media_msg.video_note
+                media_type = "video_note"
+                title = trim_title("Video Note")
+                duration = media.duration
+                if media.thumbs:
+                    thumbnail = await client.download_media(media.thumbs[0].file_id)
+            elif media_msg.document:
+                doc = media_msg.document
+                media = media_msg.document
+                mime = (doc.mime_type or "").lower()
+                if mime.startswith("video/"):
+                    media_type = "video"
+                    title = trim_title(doc.file_name or "Telegram Video")
+                    duration = getattr(doc, 'duration', 0)
+                elif mime.startswith("audio/"):
+                    media_type = "audio"
+                    title = trim_title(doc.file_name or "Telegram Audio")
+                    duration = getattr(doc, 'duration', 0)
+
+
+                if media_type and doc.thumbs:
+                    thumbnail = await client.download_media(doc.thumbs[0].file_id,f"{user_dir}/")
+            else:
+                await rich_edit(massage, rich_note(Messages.UNSUPPORTED_MEDIA), client=client)
+                return await remove_active_chat(client, target_chat_id, generation=generation)
+            if not media_type:
+                await rich_edit(massage, rich_note(Messages.UNSUPPORTED_MEDIA), client=client)
+                return await remove_active_chat(client, target_chat_id, generation=generation)
+            # Check Telegram media size against 2 GB limit
+            file_size = getattr(media, "file_size", 0) or 0
+            if file_size > MAX_FILE_SIZE_BYTES:
+                await rich_edit(massage, rich_note(Messages.FILE_TOO_LARGE), client=client)
+                return await remove_active_chat(client, target_chat_id, generation=generation)
+            # For media messages
+            youtube_link = await download_media_with_progress(
+                client,
+                massage,
+                message.reply_to_message,
+                "Media"
+            )
+            stream_url = None
+
+            # Generate thumbnail if missing
+            if not thumbnail and media_type in ["video", "video_note"]:
                 try:
-                    target_chat = await ast_session.get_chat(linked_chat.id)
-                    logger.info(f"[play] Assistant {ast_num} already in linked channel {linked_chat.id}")
-                except Exception:
-                    if getattr(linked_chat, "username", None):
-                        res = await ast_session.join_chat(linked_chat.username)
-                        if res and hasattr(res, "id"):
-                            target_chat = res
-                        logger.info(f"[play] Assistant {ast_num} joined public linked channel @{linked_chat.username}")
-                    else:
-                        chan_expire = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=60)
-                        chan_link = await client.create_chat_invite_link(linked_chat.id, member_limit=1, expire_date=chan_expire)
-                        res = await ast_session.join_chat(chan_link.invite_link)
-                        if res and hasattr(res, "id"):
-                            target_chat = res
-                        logger.info(f"[play] Assistant {ast_num} joined private linked channel {linked_chat.id} via invite link")
-                state.mark_member(ast_num, linked_chat.id)
-                break
-            else:
-                joined_chat = None
-                if message.chat.username:
-                    try:
-                        try:
-                            joined_chat = await ast_session.get_chat(message.chat.username)
-                        except Exception:
-                            joined_chat = await ast_session.join_chat(message.chat.username)
-                    except UserAlreadyParticipant:
-                        joined_chat = message.chat
-                    target_chat = joined_chat if (joined_chat and hasattr(joined_chat, "id")) else message.chat
-                    state.mark_member(ast_num, message.chat.id)
-                    break
-                else:
-                    # Private group
-                    is_admin_or_owner = False
-                    try:
-                        bot_member = await client.get_chat_member(message.chat.id, client.me.id)
-                        is_admin_or_owner = bot_member.status in (
-                            ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER
-                        )
-                    except Exception:
-                        is_admin_or_owner = False
+                    thumbnail = await asyncio.to_thread(generate_thumbnail, youtube_link, f'{user_dir}/thumb.png')
+                except Exception as e:
+                    logger.debug("Media thumbnail generation failed: %s", e)
+                    thumbnail = None
+            # Format duration
+            if not duration or duration <=0:
+                duration = await asyncio.to_thread(with_opencv, youtube_link)
+            duration = format_duration(int(duration))
+            media_info = {
+                'title': title,
+                'duration': duration,
+                'thumbnail': thumbnail,
+                'file_id': media.file_id,
+                'media_type': media_type,
+                'url': youtube_link
+            }
+        else:
+            search_query = raw_query
+            # Source seam: a playlist link expands into many per-track queries;
+            # search text or a single video URL stays a one-element list.
+            _sources = await resolve_sources(search_query)
+            first_item = _sources[0]
+            search_query = first_item[0]
+            _playlist_rest = _sources[1:]
 
-                    try:
-                        joined_chat = await ast_session.get_chat(message.chat.id)
-                        logger.info(f"[play] Assistant {ast_num} already in private group {message.chat.id}")
-                    except Exception:
-                        if not is_admin_or_owner:
-                            await rich_edit(massage, rich_note(Messages.NEED_INVITE_PERMISSION), client=client)
-                            return await remove_active_chat(client, target_chat_id)
-                        expire_at = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=60)
-                        link_obj = await client.create_chat_invite_link(message.chat.id, member_limit=1, expire_date=expire_at)
-                        joined_chat = await ast_session.join_chat(link_obj.invite_link)
-                        logger.info(f"[play] Assistant {ast_num} joined private group {message.chat.id} via invite link")
-                    target_chat = joined_chat if (joined_chat and hasattr(joined_chat, "id")) else message.chat
-                    state.mark_member(ast_num, message.chat.id)
+            # Placeholder values — join_call will wait for the task to resolve
+            title = trim_title(first_item[1] if len(first_item) > 1 and first_item[1] else search_query[:25])
+            duration = first_item[2] if len(first_item) > 2 and first_item[2] else None
+            youtube_link = None
+            thumbnail = None
+            _channel_name = None
+            _views = None
+            video_id = None
+            stream_url = None
+
+            _yt_task = asyncio.create_task(handle_youtube(search_query, mode=mode))
+            _yt_task.add_done_callback(
+                lambda t: t.exception() if not t.cancelled() else None
+            )
+
+        if not state.is_current(target_chat_id, generation):
+            return
+
+        # Start thumbnail generation in the background so the voice join is not blocked.
+        # join_call will await the task only after streaming is already live.
+        if media_info:
+            thumb = asyncio.create_task(
+                get_thumb(
+                    media_info['title'],
+                    media_info['duration'],
+                    media_info['thumbnail'],
+                    None,
+                    None,
+                    None,
+                )
+            )
+        else:
+            # join_call will create the thumb task once yt_task resolves
+            thumb = None
+        if thumb:
+            thumb.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+
+        # Set the target chat and ensure assistant has joined the target chat
+        ast_num, ast_session, ast_call_py = await get_assistant(target_chat_id, generation=generation)
+        if not state.is_current(target_chat_id, generation):
+            return
+        if not ast_session:
+            ast_session = clients.get("session")
+
+        target_chat = None
+        max_retries = get_assistant_count()
+        attempt = 0
+
+        while attempt < max_retries:
+            if not state.is_current(target_chat_id, generation):
+                return
+            attempt += 1
+            try:
+                # Fast path: this assistant was recently confirmed to be a member, so
+                # skip the get_chat -> create_chat_invite_link -> join_chat round
+                # trips. Any later failure (kick, ban, left) surfaces on call_py.play
+                # in join_call, which clears the entry so the next /play re-verifies.
+                _fp_chat = linked_chat if channel_mode else message.chat
+                if _fp_chat is not None and state.is_member_cached(ast_num, _fp_chat.id):
+                    logger.info(f"[play] Assistant {ast_num} membership cached for {_fp_chat.id}; skipping join handshake")
+                    target_chat = _fp_chat
                     break
 
-        except UserAlreadyParticipant:
-            target_chat = linked_chat if channel_mode else message.chat
-            if target_chat is not None and hasattr(target_chat, "id"):
-                state.mark_member(ast_num, target_chat.id)
-            break
-        except (InviteHashExpired, ChannelPrivate, UserBlocked) as ban_err:
-            state.forget_member(ast_num, target_chat_id)
-            if attempt < max_retries:
-                logger.warning(f"[play] Assistant {ast_num} banned/failed ({ban_err}), trying next assistant...")
-                ast_num, ast_session, ast_call_py = await change_assistant(target_chat_id)
-                continue
-            else:
-                ast_mention = ast_session.me.mention() if hasattr(ast_session.me, 'mention') else f"@{ast_session.me.username or ast_session.me.id}"
                 if channel_mode:
-                    chan_title = getattr(linked_chat, 'title', None) or str(linked_chat.id)
-                    await rich_edit(massage, rich_note(Messages.ASSISTANT_BANNED_CHANNEL.format(chan_title, ast_mention, ast_session.me.id)), client=client)
+                    target_chat = linked_chat
+                    try:
+                        target_chat = await ast_session.get_chat(linked_chat.id)
+                        logger.info(f"[play] Assistant {ast_num} already in linked channel {linked_chat.id}")
+                    except Exception:
+                        if getattr(linked_chat, "username", None):
+                            res = await ast_session.join_chat(linked_chat.username)
+                            if res and hasattr(res, "id"):
+                                target_chat = res
+                            logger.info(f"[play] Assistant {ast_num} joined public linked channel @{linked_chat.username}")
+                        else:
+                            chan_expire = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=60)
+                            chan_link = await client.create_chat_invite_link(linked_chat.id, member_limit=1, expire_date=chan_expire)
+                            res = await ast_session.join_chat(chan_link.invite_link)
+                            if res and hasattr(res, "id"):
+                                target_chat = res
+                            logger.info(f"[play] Assistant {ast_num} joined private linked channel {linked_chat.id} via invite link")
+                    state.mark_member(ast_num, linked_chat.id)
+                    break
                 else:
-                    await rich_edit(massage, rich_note(Messages.ASSISTANT_BANNED.format(ast_mention, ast_session.me.id)), client=client)
-                return await remove_active_chat(client, target_chat_id)
-        except (ChatAdminRequired, ChatWriteForbidden):
-            state.forget_member(ast_num, target_chat_id)
-            if channel_mode:
-                chan_title = getattr(linked_chat, 'title', None) or str(linked_chat.id)
-                await rich_edit(massage, rich_note(Messages.NEED_INVITE_PERMISSION_CHANNEL.format(chan_title)), client=client)
-            else:
-                await rich_edit(massage, rich_note(Messages.NEED_INVITE_PERMISSION), client=client)
-            return await remove_active_chat(client, target_chat_id)
-        except Exception as e:
-            state.forget_member(ast_num, target_chat_id)
-            err_str = str(e).lower()
-            if "chat_admin_required" in err_str or "invite" in err_str or "forbidden" in err_str:
+                    joined_chat = None
+                    if message.chat.username:
+                        try:
+                            try:
+                                joined_chat = await ast_session.get_chat(message.chat.username)
+                            except Exception:
+                                joined_chat = await ast_session.join_chat(message.chat.username)
+                        except UserAlreadyParticipant:
+                            joined_chat = message.chat
+                        target_chat = joined_chat if (joined_chat and hasattr(joined_chat, "id")) else message.chat
+                        state.mark_member(ast_num, message.chat.id)
+                        break
+                    else:
+                        # Private group
+                        is_admin_or_owner = False
+                        try:
+                            bot_member = await client.get_chat_member(message.chat.id, client.me.id)
+                            is_admin_or_owner = bot_member.status in (
+                                ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER
+                            )
+                        except Exception:
+                            is_admin_or_owner = False
+
+                        try:
+                            joined_chat = await ast_session.get_chat(message.chat.id)
+                            logger.info(f"[play] Assistant {ast_num} already in private group {message.chat.id}")
+                        except Exception:
+                            if not is_admin_or_owner:
+                                await rich_edit(massage, rich_note(Messages.NEED_INVITE_PERMISSION), client=client)
+                                return await remove_active_chat(client, target_chat_id, generation=generation)
+                            expire_at = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=60)
+                            link_obj = await client.create_chat_invite_link(message.chat.id, member_limit=1, expire_date=expire_at)
+                            joined_chat = await ast_session.join_chat(link_obj.invite_link)
+                            logger.info(f"[play] Assistant {ast_num} joined private group {message.chat.id} via invite link")
+                        target_chat = joined_chat if (joined_chat and hasattr(joined_chat, "id")) else message.chat
+                        state.mark_member(ast_num, message.chat.id)
+                        break
+
+            except UserAlreadyParticipant:
+                target_chat = linked_chat if channel_mode else message.chat
+                if target_chat is not None and hasattr(target_chat, "id"):
+                    state.mark_member(ast_num, target_chat.id)
+                break
+            except (InviteHashExpired, ChannelPrivate, UserBlocked) as ban_err:
+                state.forget_member(ast_num, target_chat_id)
+                if attempt < max_retries:
+                    logger.warning(f"[play] Assistant {ast_num} banned/failed ({ban_err}), trying next assistant...")
+                    ast_num, ast_session, ast_call_py = await change_assistant(target_chat_id, generation=generation)
+                    continue
+                else:
+                    ast_mention = ast_session.me.mention() if hasattr(ast_session.me, 'mention') else f"@{ast_session.me.username or ast_session.me.id}"
+                    if channel_mode:
+                        chan_title = getattr(linked_chat, 'title', None) or str(linked_chat.id)
+                        await rich_edit(massage, rich_note(Messages.ASSISTANT_BANNED_CHANNEL.format(chan_title, ast_mention, ast_session.me.id)), client=client)
+                    else:
+                        await rich_edit(massage, rich_note(Messages.ASSISTANT_BANNED.format(ast_mention, ast_session.me.id)), client=client)
+                    return await remove_active_chat(client, target_chat_id, generation=generation)
+            except (ChatAdminRequired, ChatWriteForbidden):
+                state.forget_member(ast_num, target_chat_id)
                 if channel_mode:
                     chan_title = getattr(linked_chat, 'title', None) or str(linked_chat.id)
                     await rich_edit(massage, rich_note(Messages.NEED_INVITE_PERMISSION_CHANNEL.format(chan_title)), client=client)
                 else:
                     await rich_edit(massage, rich_note(Messages.NEED_INVITE_PERMISSION), client=client)
-                return await remove_active_chat(client, target_chat_id)
-            if attempt < max_retries:
-                logger.warning(f"[play] Assistant {ast_num} join error ({e}), trying next assistant...")
-                ast_num, ast_session, ast_call_py = await change_assistant(target_chat_id)
-                continue
-            logger.error(f"[play] Failed to join target {target_chat_id}: {e}")
-            if channel_mode:
-                chan_title = getattr(linked_chat, 'title', None) or str(linked_chat.id)
-                await rich_edit(massage, rich_note(Messages.FAILED_JOIN_CHANNEL.format(chan_title)), client=client)
-            else:
-                await rich_edit(massage, rich_note(Messages.FAILED_JOIN_GROUP), client=client)
-            return await remove_active_chat(client, target_chat_id)
+                return await remove_active_chat(client, target_chat_id, generation=generation)
+            except Exception as e:
+                state.forget_member(ast_num, target_chat_id)
+                err_str = str(e).lower()
+                if "chat_admin_required" in err_str or "invite" in err_str or "forbidden" in err_str:
+                    if channel_mode:
+                        chan_title = getattr(linked_chat, 'title', None) or str(linked_chat.id)
+                        await rich_edit(massage, rich_note(Messages.NEED_INVITE_PERMISSION_CHANNEL.format(chan_title)), client=client)
+                    else:
+                        await rich_edit(massage, rich_note(Messages.NEED_INVITE_PERMISSION), client=client)
+                    return await remove_active_chat(client, target_chat_id, generation=generation)
+                if attempt < max_retries:
+                    logger.warning(f"[play] Assistant {ast_num} join error ({e}), trying next assistant...")
+                    ast_num, ast_session, ast_call_py = await change_assistant(target_chat_id, generation=generation)
+                    continue
+                logger.error(f"[play] Failed to join target {target_chat_id}: {e}")
+                if channel_mode:
+                    chan_title = getattr(linked_chat, 'title', None) or str(linked_chat.id)
+                    await rich_edit(massage, rich_note(Messages.FAILED_JOIN_CHANNEL.format(chan_title)), client=client)
+                else:
+                    await rich_edit(massage, rich_note(Messages.FAILED_JOIN_GROUP), client=client)
+                return await remove_active_chat(client, target_chat_id, generation=generation)
 
-    if not target_chat or not hasattr(target_chat, "id"):
-        target_chat = linked_chat if channel_mode else message.chat
+        if not target_chat or not hasattr(target_chat, "id"):
+            target_chat = linked_chat if channel_mode else message.chat
 
 
-    track_id, put_entry = await put_queue(
-        massage,
-        trim_title(title),
-        client,
-        youtube_link,
-        target_chat,
-        by,
-        duration,
-        mode,
-        thumb,
-        force_play,
-        stream_url,
-        yt_task=_yt_task,
-    )
-    # Playlist: queue the remaining tracks behind the first with direct URLs
-    # and metadata, avoiding spawning 50 unthrottled concurrent background tasks.
-    for item in _playlist_rest:
-        _url = item[0]
-        _ptitle = item[1] if len(item) > 1 and item[1] else "Playlist track"
-        _pdur = item[2] if len(item) > 2 and item[2] else "N/A"
-        await put_queue(
+        if not state.is_current(target_chat_id, generation):
+            return
+
+        track_id, put_entry = await put_queue(
             massage,
-            trim_title(_ptitle),
+            trim_title(title),
             client,
-            _url,
+            youtube_link,
             target_chat,
             by,
-            _pdur,
+            duration,
             mode,
-            None,
-            False,
-            None,
-            yt_task=None,
+            thumb,
+            force_play,
+            stream_url,
+            yt_task=_yt_task,
+            generation=generation,
         )
-    if _playlist_rest:
-        await rich_reply(
-            message,
-            rich_note(Messages.PLAYLIST_QUEUED.format(len(_playlist_rest) + 1)),
-            client=client,
-        )
-    if is_active and not force_play:
-                if _yt_task and duration is None:
-                    try:
-                        yt_result = await _yt_task
-                        if yt_result:
-                            title = trim_title(yt_result[0]) if yt_result[0] else title
-                            duration = yt_result[1] if yt_result[1] else "N/A"
-                            youtube_link = yt_result[2] if yt_result[2] else youtube_link
-                    except Exception:
-                        duration = "N/A"
-                target_chat_id = target_chat.id if hasattr(target_chat, "id") else (linked_chat.id if channel_mode else message.chat.id)
-                position = len(state.queues.get(target_chat_id, []))
-                keyboard = Buttons.queue_markup(track_id, channel_mode)
-                is_local_file = bool(youtube_link) and os.path.exists(youtube_link)
-                video_id = extract_video_id(youtube_link) if youtube_link and not is_local_file else None
-                _safe_title = _html.escape(trim_title(title))
-                if video_id:
-                    title_text = f'<a href="https://t.me/{client.me.username}?start=vidid_{video_id}"><b>{_safe_title}</b></a>'
-                elif youtube_link and youtube_link.startswith("http"):
-                    title_text = f'<a href="{youtube_link}"><b>{_safe_title}</b></a>'
-                else:
-                    title_text = f'<b>{_safe_title}</b>'
-                queue_msg = await rich_send(
-                    client,
-                    message.chat.id,
-                    Messages.QUEUE.format(mode, title_text, duration, position_tag(position)),
-                    reply_markup=keyboard,
-                )
-                if put_entry:
-                    put_entry.queue_msg = queue_msg
-                _bg(massage.delete())
+        if put_entry is None:
+            return
+        # Playlist: queue the remaining tracks behind the first with direct URLs
+        # and metadata, avoiding spawning 50 unthrottled concurrent background tasks.
+        for item in _playlist_rest:
+            _url = item[0]
+            _ptitle = item[1] if len(item) > 1 and item[1] else "Playlist track"
+            _pdur = item[2] if len(item) > 2 and item[2] else "N/A"
+            _rest_id, rest_entry = await put_queue(
+                massage,
+                trim_title(_ptitle),
+                client,
+                _url,
+                target_chat,
+                by,
+                _pdur,
+                mode,
+                None,
+                False,
+                None,
+                yt_task=None,
+                generation=generation,
+            )
+            if rest_entry is None:
+                return
+        if _playlist_rest:
+            await rich_reply(
+                message,
+                rich_note(Messages.PLAYLIST_QUEUED.format(len(_playlist_rest) + 1)),
+                client=client,
+            )
+        if is_active and not force_play:
+            if _yt_task and duration is None:
                 try:
-                    await message.delete()
-                except Exception as e:
-                    logger.debug(f"[play] Failed to delete command message {message.id} in {message.chat.id}: {e}")
+                    yt_result = await _yt_task
+                    if yt_result:
+                        title = trim_title(yt_result[0]) if yt_result[0] else title
+                        duration = yt_result[1] if yt_result[1] else "N/A"
+                        youtube_link = yt_result[2] if yt_result[2] else youtube_link
+                except Exception:
+                    duration = "N/A"
+            if not state.is_current(target_chat_id, generation):
+                return
+            target_chat_id = target_chat.id if hasattr(target_chat, "id") else (linked_chat.id if channel_mode else message.chat.id)
+            position = len(state.queues.get(target_chat_id, []))
+            keyboard = Buttons.queue_markup(track_id, channel_mode)
+            is_local_file = bool(youtube_link) and os.path.exists(youtube_link)
+            video_id = extract_video_id(youtube_link) if youtube_link and not is_local_file else None
+            _safe_title = _html.escape(trim_title(title))
+            if video_id:
+                title_text = f'<a href="https://t.me/{client.me.username}?start=vidid_{video_id}"><b>{_safe_title}</b></a>'
+            elif youtube_link and youtube_link.startswith("http"):
+                title_text = f'<a href="{youtube_link}"><b>{_safe_title}</b></a>'
+            else:
+                title_text = f'<b>{_safe_title}</b>'
+            queue_msg = await rich_send(
+                client,
+                message.chat.id,
+                Messages.QUEUE.format(mode, title_text, duration, position_tag(position)),
+                reply_markup=keyboard,
+            )
+            if not state.is_current(target_chat_id, generation):
+                if queue_msg:
+                    try:
+                        await queue_msg.delete()
+                    except Exception:
+                        pass
+                return
+            if put_entry:
+                put_entry.queue_msg = queue_msg
+            _bg(massage.delete())
+            try:
+                await message.delete()
+            except Exception as e:
+                logger.debug(f"[play] Failed to delete command message {message.id} in {message.chat.id}: {e}")
 
 
-    else:
-      await dend(client, massage, target_chat_id if channel_mode else None)
-    try:
-        await message.delete()
-    except Exception:
-        pass  # ponytail: bot may lack delete rights / service msg — non-fatal
+        else:
+            await dend(client, massage, target_chat_id if channel_mode else None, generation=generation)
+        try:
+            await message.delete()
+        except Exception:
+            pass  # ponytail: bot may lack delete rights / service msg — non-fatal
 
 
 async def put_queue(
@@ -641,6 +687,7 @@ async def put_queue(
     stream_url=None,
     track_id=None,
     yt_task=None,
+    generation=None,
 ):
     try:
         _duration_in_seconds = (time_to_seconds(duration) - 3) if duration else 0
@@ -649,6 +696,7 @@ async def put_queue(
     track_id = track_id or uuid.uuid4().hex[:12]
     safe_chat = chat if (chat and hasattr(chat, "id")) else getattr(message, "chat", chat)
     chat_id = getattr(safe_chat, "id", safe_chat)
+    generation = state.generation(chat_id) if generation is None else generation
     ui_chat_id = message.chat.id if (message and hasattr(message, "chat") and message.chat) else chat_id
     put = QueueEntry(
         message=message,
@@ -665,19 +713,12 @@ async def put_queue(
         _yt_task=yt_task,
         ui_chat_id=ui_chat_id,
     )
-    if forceplay:
-        async with state.lock(chat_id):
-            check = state.queues.get(chat_id)
-            if check:
-                state.queues[chat_id].insert(0, put)
-            else:
-                state.queues[chat_id] = []
-                state.queues[chat_id].append(put)
-    else:
-        async with state.lock(chat_id):
-            check = state.queues.get(chat_id)
-
-            if not check:
-               state.queues[chat_id] = []
-            state.queues[chat_id].append(put)
+    async with state.lock(chat_id):
+        if not state.is_current(chat_id, generation):
+            return track_id, None
+        queue = state.queues.setdefault(chat_id, [])
+        if forceplay:
+            queue.insert(0, put)
+        else:
+            queue.append(put)
     return track_id, put

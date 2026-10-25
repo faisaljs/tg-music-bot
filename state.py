@@ -40,6 +40,9 @@ class SessionStore:
         # ponytail: one lock per chat_id, created on demand and never reaped;
         # locks are tiny, and a bot serving even 100k chats is well within budget.
         self._locks = defaultdict(asyncio.Lock)
+        self._request_locks = defaultdict(asyncio.Lock)
+        self._playback_locks = defaultdict(asyncio.Lock)
+        self._generations = defaultdict(int)
 
     # ── Assistant membership cache ────────────────────────────────────────────
     MEMBERSHIP_TTL = 21600  # 6h: long enough to help, short enough to re-verify
@@ -93,10 +96,31 @@ class SessionStore:
         """Per-chat lock. Wrap any queue/active read-modify-write in `async with`."""
         return self._locks[chat_id]
 
+    def request_lock(self, chat_id):
+        """Serialize command preparation so slow first requests retain queue order."""
+        return self._request_locks[int(chat_id)]
+
+    def playback_lock(self, chat_id):
+        """Serialize final stream replacement and leaving the voice call."""
+        return self._playback_locks[int(chat_id)]
+
+    def generation(self, chat_id):
+        return self._generations[int(chat_id)]
+
+    def is_current(self, chat_id, generation):
+        return self.generation(chat_id) == generation
+
+    def invalidate(self, chat_id):
+        """Revoke pending work before stopping or explicitly replacing playback."""
+        cid = int(chat_id)
+        self._generations[cid] += 1
+        self.cancel_suggest(cid)
+        return self._generations[cid]
+
     def cancel_suggest(self, chat_id):
         """Cancel any pending suggestion countdown task for chat_id."""
         task = self.suggest_tasks.pop(chat_id, None)
-        if task and not task.done():
+        if task and not task.done() and task is not asyncio.current_task():
             task.cancel()
             return True
         return False
@@ -157,10 +181,12 @@ class SessionStore:
         """Remove the in-memory assistant assignment for chat_id."""
         self.chat_assistants.pop(int(chat_id), None)
 
-    async def activate(self, chat_id: int, assistant_num: int | None = None):
+    async def activate(self, chat_id: int, assistant_num: int | None = None, *, generation=None):
         """Atomically mark a chat active. Returns True iff it was NOT already active
         (i.e. this caller is the one that should start playback, not enqueue)."""
         async with self.lock(chat_id):
+            if generation is not None and not self.is_current(chat_id, generation):
+                return False
             was_active = chat_id in self.active
             self.active.add(chat_id)
             if assistant_num is not None:
@@ -170,13 +196,14 @@ class SessionStore:
                 self.assistant_active[int(assistant_num)].add(chat_id)
             return not was_active
 
-    async def deactivate(self, chat_id: int):
+    async def deactivate(self, chat_id: int, *, generation=None, clear_queue=False):
         """Release a chat's voice-call slot and assistant binding.
 
-        Deliberately does NOT touch `queues` or `playing`: deactivate() runs from
+        By default does NOT touch `queues` or `playing`: deactivate() runs from
         recoverable error paths (a failed join, a transient stream error) where
         the caller still intends to retry with the queue intact. Callers that do
-        want the queue gone (/stop, /end, kicked-from-VC) pop it explicitly.
+        want the queue gone pass clear_queue=True (for an atomic stop) or pop it
+        explicitly under this same lock.
 
         Locks are never reaped here either -- `locked()` goes briefly False
         between release() and the woken waiter resuming, so popping the lock
@@ -185,6 +212,12 @@ class SessionStore:
         """
         cid = int(chat_id)
         async with self.lock(cid):
+            if generation is not None and not self.is_current(cid, generation):
+                return False
+            self.invalidate(cid)
+            if clear_queue:
+                self.queues.pop(cid, None)
+                self.playing.pop(cid, None)
             self.active.discard(cid)
             self.active.discard(chat_id)
             self.paused_at.pop(cid, None)
@@ -193,8 +226,13 @@ class SessionStore:
             for ast_set in self.assistant_active.values():
                 ast_set.discard(cid)
                 ast_set.discard(chat_id)
-            self.now_playing_msgs.pop(cid, None)
-            self.now_playing_msgs.pop(chat_id, None)
+            message = self.pop_now_playing(cid)
+        if message:
+            try:
+                await message.delete()
+            except Exception as exc:
+                logger.debug("[state] Deleting playback panel in %s failed: %s", cid, exc)
+        return True
 
     async def pop_track(self, chat_id, track_id):
         """Remove and return the queued entry with this _track_id, or None if it

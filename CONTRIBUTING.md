@@ -6,7 +6,7 @@ Thanks for your interest! nub-music-bot is a Telegram music bot built on Pyrogra
 
 ### Prerequisites
 
-- Python 3.10+
+- Python 3.12+
 - FFmpeg installed on your system
 - MongoDB (local or cloud URI)
 - Telegram API credentials (API_ID, API_HASH)

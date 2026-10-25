@@ -1,7 +1,7 @@
  # nub-music-bot
 
 [![License](https://img.shields.io/github/license/nub-coders/nub-music-bot?color=0f766e)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://python.org)
+[![Python](https://img.shields.io/badge/python-3.12+-blue.svg)](https://python.org)
 [![Issues](https://img.shields.io/github/issues/nub-coders/nub-music-bot?color=0f766e)](https://github.com/nub-coders/nub-music-bot/issues)
 [![Pull Requests](https://img.shields.io/github/issues-pr/nub-coders/nub-music-bot?color=0f766e)](https://github.com/nub-coders/nub-music-bot/pulls)
 [![Last Commit](https://img.shields.io/github/last-commit/nub-coders/nub-music-bot)](https://github.com/nub-coders/nub-music-bot/commits/main)
@@ -23,7 +23,7 @@
 
  Requirements
  ------------
- - Python 3.10+
+ - Python 3.12+ (required by the pinned NumPy version; Docker and CI use 3.13)
  - `ffmpeg` installed on the host
  - MongoDB (or a compatible MongoDB URI)
 

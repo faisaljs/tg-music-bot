@@ -1,5 +1,11 @@
 import asyncio
+import io
+import math
+import shlex
 import shutil
+import ssl
+import struct
+import wave
 from unittest.mock import AsyncMock
 
 import httpcore
@@ -149,6 +155,7 @@ async def test_ffprobe_redirect_cannot_reach_private_origin(allow_localhost, mon
     """Exercise the real subprocess, including PyTgCalls option placement."""
     from pytgcalls.ffmpeg import build_command
     from pytgcalls.types.raw import AudioParameters
+    from tools import make_media_stream
 
     hits = []
 
@@ -176,12 +183,97 @@ async def test_ffprobe_redirect_cannot_reach_private_origin(allow_localhost, mon
         proxy_url = await proxy.start()
         monkeypatch.setattr(media_guard, "get_media_proxy", AsyncMock(return_value=proxy_url))
         url = f"http://public.test:{port}/song.mp3"
-        options = await media_guard.media_options(url)
-        cmd = build_command("ffprobe", options["ffmpeg_parameters"], url, AudioParameters())
+        media = await make_media_stream(url)
+        assert media._ytdlp_parameters == f"--proxy {proxy_url}"
+        cmd = build_command("ffprobe", media._ffmpeg_parameters, url, AudioParameters())
         process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         await asyncio.wait_for(process.communicate(), timeout=10)
         assert process.returncode != 0
         assert hits == [b"GET /song.mp3 HTTP/1.1"]
+    finally:
+        if process and process.returncode is None:
+            process.kill()
+            await process.wait()
+        await proxy.close()
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.skipif(
+    not all(shutil.which(binary) for binary in ("ffprobe", "ffmpeg", "openssl")),
+    reason="ffprobe, ffmpeg and openssl are required",
+)
+async def test_https_stream_keeps_audio_and_decodes_through_proxy(allow_localhost, monkeypatch, tmp_path):
+    """Exercise HTTPS CONNECT with the actual probe and player commands."""
+    from tools import make_media_stream
+
+    cert, key = tmp_path / "cert.pem", tmp_path / "key.pem"
+    openssl = await asyncio.create_subprocess_exec(
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+        "-subj", "/CN=public.test", "-keyout", str(key), "-out", str(cert),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, error = await asyncio.wait_for(openssl.communicate(), 10)
+        assert openssl.returncode == 0, error.decode()
+    finally:
+        if openssl.returncode is None:
+            openssl.kill()
+            await openssl.wait()
+
+    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls.load_cert_chain(cert, key)
+    audio = io.BytesIO()
+    with wave.open(audio, "wb") as wav:
+        wav.setparams((1, 2, 48000, 0, "NONE", "not compressed"))
+        # Keep enough input for FFmpeg's stream analysis before EOF reconnects.
+        wav.writeframes(b"".join(
+            struct.pack("<h", int(10000 * math.sin(2 * math.pi * 440 * i / 48000)))
+            for i in range(48000)
+        ) * 10)
+    body = audio.getvalue()
+    requests = []
+
+    async def origin(reader, writer):
+        try:
+            requests.append(await reader.readuntil(b"\r\n\r\n"))
+            writer.write(
+                f"HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+                + body
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(origin, "127.0.0.1", 0, ssl=tls)
+    port = server.sockets[0].getsockname()[1]
+    original_addresses = media_guard.public_addresses
+
+    async def addresses(host, port, **kwargs):
+        if host == "public.test":
+            return ["127.0.0.1"]  # Only the test TLS origin is allowed onto loopback.
+        return await original_addresses(host, port, **kwargs)
+
+    monkeypatch.setattr(media_guard, "public_addresses", addresses)
+    proxy = media_guard.MediaProxy()
+    process = None
+    try:
+        proxy_url = await proxy.start()
+        monkeypatch.setattr(media_guard, "get_media_proxy", AsyncMock(return_value=proxy_url))
+        media = await make_media_stream(f"https://public.test:{port}/song.wav")
+        await asyncio.wait_for(media.check_stream(), 10)
+        assert media.microphone is not None, "HTTPS probing must retain the audio input"
+
+        command = shlex.split(media.microphone.path)
+        command[-1:-1] = ["-t", "0.25"]  # Bound the output of the actual player command.
+        process = await asyncio.create_subprocess_exec(
+            *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        pcm, error = await asyncio.wait_for(process.communicate(), 10)
+        assert process.returncode == 0, error.decode()
+        assert len(pcm) > 1000 and any(pcm), "HTTPS playback must produce non-silent PCM"
+        assert len(requests) >= 2  # The probe and the player both reached the TLS origin.
     finally:
         if process and process.returncode is None:
             process.kill()

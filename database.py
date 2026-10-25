@@ -417,22 +417,48 @@ async def add_track_to_playlist(user_id: int, playlist_id: str, track: dict, max
 
 
 async def remove_track_from_playlist(user_id: int, playlist_id: str, track_index: int) -> bool:
-    """Remove a track by 0-based index from a user's playlist."""
+    """Remove the selected track while preserving concurrent playlist changes."""
     try:
         uid = int(user_id)
-        doc = await user_playlists.find_one({"user_id": uid})
-        if not doc:
+        pid = str(playlist_id)
+        playlist = await get_playlist(uid, pid)
+        if not playlist:
             return False
-        for pl in doc.get("playlists", []):
-            if pl.get("id") == str(playlist_id):
-                tracks = pl.get("tracks", [])
-                if 0 <= track_index < len(tracks):
-                    tracks.pop(track_index)
-                    await user_playlists.update_one(
-                        {"user_id": uid, "playlists.id": str(playlist_id)},
-                        {"$set": {"playlists.$.tracks": tracks}},
-                    )
-                    return True
+        tracks = playlist.get("tracks", [])
+        if not 0 <= track_index < len(tracks):
+            return False
+        target = tracks[track_index]
+        target_id = target.get("id")
+
+        # Modern entries have stable IDs, so removing one needs no replacement
+        # array. Bind the positional update to the same playlist as the track.
+        if target_id and sum(t.get("id") == target_id for t in tracks) == 1:
+            res = await user_playlists.update_one(
+                {"user_id": uid, "playlists": {"$elemMatch": {"id": pid, "tracks.id": target_id}}},
+                {"$pull": {"playlists.$.tracks": {"id": target_id}}},
+            )
+            return res.modified_count > 0
+
+        # Older documents may lack IDs. Replace only the exact array we read;
+        # on a conflict, find the same entry in the fresh array and retry. If
+        # identical legacy entries make that selection ambiguous, fail safely.
+        ambiguous_target = tracks.count(target) > 1
+        for _ in range(3):
+            res = await user_playlists.update_one(
+                {"user_id": uid, "playlists": {"$elemMatch": {"id": pid, "tracks": tracks}}},
+                {"$set": {"playlists.$.tracks": tracks[:track_index] + tracks[track_index + 1:]}},
+            )
+            if res.modified_count > 0:
+                return True
+            if ambiguous_target:
+                return False
+            playlist = await get_playlist(uid, pid)
+            if not playlist:
+                return False
+            tracks = playlist.get("tracks", [])
+            if tracks.count(target) != 1:
+                return False
+            track_index = tracks.index(target)
         return False
     except Exception as e:
         logger.warning(f"[db] remove_track_from_playlist error: {e}")

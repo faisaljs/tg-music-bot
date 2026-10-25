@@ -198,9 +198,12 @@ async def is_authorized(client, chat_id, user_id, allow_auth_users=True):
 
     Owner / admin / sudo / chat-AUTH user / Telegram chat admin. The shared
     answer behind @admin_only() and any handler that needs the same call plus an
-    exemption of its own. In-memory checks first; the cached get_chat_member
-    round-trip only happens when none of them matched.
+    exemption of its own. Blocks take precedence over every privilege. In-memory
+    checks first; the cached get_chat_member round-trip only happens when none of
+    them matched.
     """
+    if user_id in BLOCK:
+        return False
     if is_bot_operator(user_id):
         return True
     if allow_auth_users and user_id in AUTH.get(str(chat_id), []):
@@ -239,6 +242,20 @@ def admin_only():
                     reply_id = update.id
                     user_id = update.from_user.id if update.from_user else None
                     command = update.command[0].lower()
+
+                # Reject before all role checks and the song-owner skip exemption.
+                if user_id in BLOCK:
+                    if isinstance(update, CallbackQuery):
+                        await update.answer(Messages.ADMIN_RESTRICTED_ACTION, show_alert=True)
+                    else:
+                        await rich_reply(
+                            update,
+                            rich_heading(f"{EmojiTag.LOCK} Permission Denied", 3)
+                            + rich_note(Messages.ADMIN_RESTRICTED_CMD),
+                            ephemeral=True,
+                            client=client,
+                        )
+                    return
 
                 if not user_id:
                     linked_chat = await client.get_chat(chat_id)
@@ -324,13 +341,23 @@ async def is_active_chat(client, chat_id):  # noqa: F811
     return chat_id in state.active
 async def add_active_chat(client, chat_id):  # noqa: F811
     state.active.add(chat_id)
-async def remove_active_chat(client, chat_id):
-    await state.deactivate(chat_id)
-    db_task(db_remove_chat_assistant(chat_id))
+async def remove_active_chat(client, chat_id, *, generation=None, clear_queue=False):
+    cleanup_generation = state.generation(chat_id) + 1
+    if not await state.deactivate(chat_id, generation=generation, clear_queue=clear_queue):
+        return False
+    if not state.is_current(chat_id, cleanup_generation) or chat_id in state.active:
+        return True
+
+    async def remove_idle_assignment():
+        if state.is_current(chat_id, cleanup_generation) and chat_id not in state.active:
+            await db_remove_chat_assistant(chat_id)
+
+    db_task(remove_idle_assignment())
     bot_id = getattr(client.me, "id", None) if client and getattr(client, "me", None) else "default"
     chat_dir = f"{ggg}/user_{bot_id}/{chat_id}"
     os.makedirs(chat_dir, exist_ok=True)
     clear_directory(chat_dir)
+    return True
 async def get_user_data(user_id, key):
     user_data = await user_sessions.find_one({"bot_id": user_id})
     if user_data and key in user_data:

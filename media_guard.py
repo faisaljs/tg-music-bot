@@ -216,7 +216,8 @@ async def media_options(source, ffmpeg_parameters=""):
         return {"ffmpeg_parameters": f"-protocol_whitelist file,pipe {ffmpeg_parameters}".strip()}
     proxy = await get_media_proxy()
     # Exclude file/data/concat and other protocols from remote nested inputs.
+    # HTTPS CONNECT uses FFmpeg's httpproxy protocol as well as http/https.
     return {
-        "ffmpeg_parameters": f"-http_proxy {proxy} -protocol_whitelist http,https,tcp,tls,crypto {ffmpeg_parameters}".strip(),
+        "ffmpeg_parameters": f"-http_proxy {proxy} -protocol_whitelist http,https,httpproxy,tcp,tls,crypto {ffmpeg_parameters}".strip(),
         "ytdlp_parameters": f"--proxy {proxy}",
     }

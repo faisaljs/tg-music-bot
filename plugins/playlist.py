@@ -458,50 +458,46 @@ async def _play_playlist_tracks(client: Client, message_or_cb, playlist: dict, s
     if shuffle:
         random.shuffle(tracks)
 
-    if isinstance(message_or_cb, CallbackQuery):
-        await message_or_cb.answer(f"▶️ Playing '{playlist['name']}' ({len(tracks)} tracks)...", show_alert=False)
+    generation = state.generation(target_chat_id)
+    async with state.request_lock(target_chat_id):
+        if not state.is_current(target_chat_id, generation):
+            return
+        state.cancel_suggest(target_chat_id)
+        is_active = not await state.activate(target_chat_id, generation=generation)
+        if is_active and target_chat_id not in state.playing and not state.queues.get(target_chat_id):
+            is_active = False
+            generation = state.invalidate(target_chat_id)
+        if isinstance(message_or_cb, CallbackQuery):
+            await message_or_cb.answer(f"▶️ Playing '{playlist['name']}' ({len(tracks)} tracks)...", show_alert=False)
 
-    # Send status message
-    status_msg = await client.send_message(
-        chat.id,
-        Messages.PLAYLIST_PLAYING.format(len(tracks), playlist['name']),
-        link_preview_options=None,
-    )
-
-    is_active = not await state.activate(target_chat_id)
-
-    mode = "video" if video_mode else "audio"
-
-    # Queue all tracks
-    for i, t in enumerate(tracks):
-        _url = t.get("yt_link") or (f"https://www.youtube.com/watch?v={t['video_id']}" if t.get("video_id") else t.get("title"))
-        _title = t.get("title", "Playlist track")
-        _dur = t.get("duration", "N/A")
-
-        # For the first track, create yt_task if needed
-        yt_task = None
-        if i == 0 and _url:
-            yt_task = asyncio.create_task(handle_youtube(_url))
-            yt_task.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
-
-        await put_queue(
-            status_msg,
-            trim_title(_title),
-            client,
-            _url,
-            target_chat,
-            by_user,
-            _dur,
-            mode,
-            None,
-            forceplay=False,
-            stream_url=None,
-            yt_task=yt_task,
+        status_msg = await client.send_message(
+            chat.id,
+            Messages.PLAYLIST_PLAYING.format(len(tracks), playlist['name']),
+            link_preview_options=None,
         )
+        if not state.is_current(target_chat_id, generation):
+            return
+        mode = "video" if video_mode else "audio"
 
-    if not is_active:
-        # Chat was not active, trigger dend to start streaming immediately
-        await dend(client, status_msg, target_chat_id if channel_mode else None)
+        for i, t in enumerate(tracks):
+            if not state.is_current(target_chat_id, generation):
+                return
+            _url = t.get("yt_link") or (f"https://www.youtube.com/watch?v={t['video_id']}" if t.get("video_id") else t.get("title"))
+            _title = t.get("title", "Playlist track")
+            _dur = t.get("duration", "N/A")
+            yt_task = None
+            if i == 0 and _url:
+                yt_task = asyncio.create_task(handle_youtube(_url, mode=mode))
+                yt_task.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+
+            await put_queue(
+                status_msg, trim_title(_title), client, _url, target_chat,
+                by_user, _dur, mode, None, forceplay=False, stream_url=None,
+                yt_task=yt_task, generation=generation,
+            )
+
+        if not is_active:
+            await dend(client, status_msg, target_chat_id if channel_mode else None, generation=generation)
 
 
 @Client.on_callback_query(filters.regex(r"^pl_play_([a-zA-Z0-9]+)$"))

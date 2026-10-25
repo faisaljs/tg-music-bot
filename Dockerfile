@@ -22,9 +22,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-RUN echo '#!/bin/bash\necho "Starting application..."\npython3 main.py' > start.sh && \
-    chmod +x start.sh
 RUN chown -R root:root /root/.mozilla 2>/dev/null || true
 
-# Default command
-CMD ["./start.sh"]
+# Run Python as PID 1 so Docker's stop signal reaches its shutdown handlers.
+CMD ["python3", "main.py"]

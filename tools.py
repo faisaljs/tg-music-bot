@@ -40,6 +40,7 @@ from utils.rich_ui import (
     rich_button, rich_caption, rich_code, rich_edit, rich_esc, rich_note, rich_send, rich_send_blocks, rich_table,
 )
 from thumbnails import get_thumb
+from media_guard import media_options
 
 
 async def get_stream_url(youtube_url: str, mode: str = "audio", skip_api: bool = False):
@@ -54,7 +55,6 @@ async def get_stream_url(youtube_url: str, mode: str = "audio", skip_api: bool =
     youtube_pattern = r'^(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+'
     if not re.match(youtube_pattern, youtube_url):
         logger.info(f"[DIRECT URL] Not a YouTube URL, returning as-is: {youtube_url}")
-        print(f"[DIRECT URL] Non-YouTube direct stream URL: {youtube_url}", flush=True)
         return youtube_url
 
     if mode == "video":
@@ -64,8 +64,17 @@ async def get_stream_url(youtube_url: str, mode: str = "audio", skip_api: bool =
 
     if res:
         logger.info(f"[DIRECT URL] Resolved {mode} stream URL: {res}")
-        print(f"[DIRECT URL] Resolved {mode} stream URL: {res}", flush=True)
     return res
+
+
+async def make_media_stream(source, mode="audio", ffmpeg_parameters=""):
+    """Apply the same egress restrictions to initial playback, retries and seek."""
+    options = await media_options(source, ffmpeg_parameters)
+    return MediaStream(
+        source, AudioQuality.STUDIO, VideoQuality.HD_720p,
+        video_flags=MediaStream.Flags.IGNORE if mode == "audio" else None,
+        **options,
+    )
 
 
 from state import state  # state.queues / playing / played / active now live on this store
@@ -102,14 +111,17 @@ def get_least_loaded_assistant() -> int:
     return min(active_keys, key=get_load)
 
 
-async def get_assistant(chat_id: int):
+async def get_assistant(chat_id: int, *, generation=None):
     """
     Retrieve the assigned (assistant_num, userbot_client, pytgcalls_client) for chat_id.
     Resolution order: in-memory state -> MongoDB -> least-loaded allocation.
     Guarded by _assistant_alloc_lock to prevent concurrent allocation race conditions.
     """
     cid = int(chat_id)
+    generation = state.generation(cid) if generation is None else generation
     async with _assistant_alloc_lock:
+        if not state.is_current(cid, generation):
+            return None, None, None
         # 1. In-memory cache
         ast_num = state.get_chat_assistant(cid)
         if ast_num and ast_num in assistants:
@@ -119,6 +131,8 @@ async def get_assistant(chat_id: int):
 
         # 2. Database persistent assignment
         db_num = await db_get_chat_assistant(cid)
+        if not state.is_current(cid, generation):
+            return None, None, None
         if db_num:
             if db_num in assistants:
                 state.set_chat_assistant(cid, db_num)
@@ -135,15 +149,18 @@ async def get_assistant(chat_id: int):
         return assigned, userbot, call_py
 
 
-async def set_assistant(chat_id: int, assistant_num: int):
+async def set_assistant(chat_id: int, assistant_num: int, *, generation=None):
     """Explicitly assign an assistant index (1..N) to chat_id."""
     cid = int(chat_id)
     ast_num = int(assistant_num)
+    if generation is not None and not state.is_current(cid, generation):
+        return False
     state.set_chat_assistant(cid, ast_num)
     await db_set_chat_assistant(cid, ast_num)
+    return generation is None or state.is_current(cid, generation)
 
 
-async def change_assistant(chat_id: int):
+async def change_assistant(chat_id: int, *, generation=None):
     """Switch to the next available assistant in the pool."""
     cid = int(chat_id)
     if not assistants:
@@ -154,7 +171,8 @@ async def change_assistant(chat_id: int):
         next_idx = available[(available.index(curr) + 1) % len(available)]
     else:
         next_idx = available[0]
-    await set_assistant(cid, next_idx)
+    if not await set_assistant(cid, next_idx, generation=generation):
+        return None, None, None
     return next_idx, assistants.get(next_idx), calls.get(next_idx)
 
 
@@ -303,14 +321,26 @@ def get_arg(message):
 
 
 
-async def remove_active_chat(chat_id):
-    await state.deactivate(chat_id)
-    db_task(db_remove_chat_assistant(chat_id))
+async def remove_active_chat(chat_id, *, generation=None, clear_queue=False):
+    cleanup_generation = state.generation(chat_id) + 1
+    if not await state.deactivate(chat_id, generation=generation, clear_queue=clear_queue):
+        return False
+    # Panel deletion yields. A new /play can reserve this chat meanwhile, so
+    # its assignment and downloaded media must survive the old cleanup.
+    if not state.is_current(chat_id, cleanup_generation) or chat_id in state.active:
+        return True
+
+    async def remove_idle_assignment():
+        if state.is_current(chat_id, cleanup_generation) and chat_id not in state.active:
+            await db_remove_chat_assistant(chat_id)
+
+    db_task(remove_idle_assignment())
     bot_client = clients.get("bot")
     bot_id = getattr(bot_client.me, "id", None) if bot_client and getattr(bot_client, "me", None) else "default"
     chat_dir = f"{ggg}/user_{bot_id}/{chat_id}"
     os.makedirs(chat_dir, exist_ok=True)
     clear_directory(chat_dir)
+    return True
 
 
 STREAM_END_GRACE_SECONDS = 20
@@ -323,6 +353,7 @@ async def auto_skip_stalled_track(chat_id: int, duration_seconds: int) -> bool:
     progress task has no Telegram callback to authorize, answer, or edit.
     """
     chat_id = int(chat_id)
+    generation = state.generation(chat_id)
     if chat_id in state.stalled_skips:
         return False
     state.stalled_skips.add(chat_id)
@@ -334,13 +365,22 @@ async def auto_skip_stalled_track(chat_id: int, duration_seconds: int) -> bool:
             return False
 
         active_cp = get_call_client(chat_id) or clients.get("call_py")
-        next_song = (state.queues.get(chat_id) or [None]).pop(0)
+        async with state.lock(chat_id):
+            if not state.is_current(chat_id, generation) or state.playing.get(chat_id) is not current_song:
+                return False
+            queue = state.queues.get(chat_id)
+            next_song = queue.pop(0) if queue else None
         if next_song:
             try:
-                if active_cp:
-                    await active_cp.pause(chat_id)
+                async with state.playback_lock(chat_id):
+                    if not state.is_current(chat_id, generation):
+                        return False
+                    if active_cp:
+                        await active_cp.pause(chat_id)
             except Exception as exc:
                 logger.warning("[auto_skip] Could not pause stalled stream in %s: %s", chat_id, exc)
+            if not state.is_current(chat_id, generation):
+                return False
             await state.delete_now_playing(chat_id)
             await join_call(
                 next_song["message"],
@@ -355,19 +395,46 @@ async def auto_skip_stalled_track(chat_id: int, duration_seconds: int) -> bool:
                 yt_task=next_song.get("_yt_task"),
                 queue_msg=next_song.get("queue_msg"),
                 assistant_num=state.get_chat_assistant(chat_id),
+                generation=generation,
             )
             logger.warning("[auto_skip] Advanced stalled track in chat %s", chat_id)
             return True
 
+        last_vid = extract_video_id(current_song.get("yt_link") or "") or current_song.get("video_id")
+        if state.is_autoplay_enabled(chat_id) and last_vid:
+            # A missed stream-end event must still hand the last song to
+            # autoplay, just like an explicit skip with an empty queue.
+            try:
+                async with state.playback_lock(chat_id):
+                    if not state.is_current(chat_id, generation) or state.playing.get(chat_id) is not current_song:
+                        return False
+                    if active_cp:
+                        await active_cp.pause(chat_id)
+            except Exception as exc:
+                logger.warning("[auto_skip] Could not pause before suggestions in %s: %s", chat_id, exc)
+            async with state.lock(chat_id):
+                if not state.is_current(chat_id, generation) or state.playing.get(chat_id) is not current_song:
+                    return False
+                state.playing.pop(chat_id, None)
+                state.last_played[chat_id] = current_song
+            await state.delete_now_playing(chat_id)
+            if not state.is_current(chat_id, generation):
+                return False
+            asyncio.create_task(_trigger_suggestions(active_cp, chat_id, current_song, generation=generation))
+            logger.info("[auto_skip] Starting suggestions after stalled track in chat %s", chat_id)
+            return True
+
         try:
             if active_cp:
-                await active_cp.leave_call(chat_id)
+                await _leave_current_call(active_cp, chat_id, generation)
         except Exception as exc:
             logger.warning("[auto_skip] Could not leave stalled call in %s: %s", chat_id, exc)
-        await remove_active_chat(chat_id)
-        state.queues.pop(chat_id, None)
-        state.playing.pop(chat_id, None)
-        await state.delete_now_playing(chat_id)
+        async with state.lock(chat_id):
+            if not state.is_current(chat_id, generation):
+                return False
+            state.queues.pop(chat_id, None)
+            state.playing.pop(chat_id, None)
+        await remove_active_chat(chat_id, generation=generation)
         logger.warning("[auto_skip] Cleared stalled track in chat %s", chat_id)
         return True
     except Exception:
@@ -454,25 +521,31 @@ async def count_listeners(chat_id: int) -> int:
         return 1
 
 
-async def autoleave_vc(chat_id: int) -> bool:
+async def autoleave_vc(chat_id: int, *, generation=None) -> bool:
     """
     Quickly check if voice chat has listeners. If empty, leave call and clean up immediately.
     Returns True if call was empty and left, False if listeners are present.
     """
+    generation = state.generation(chat_id) if generation is None else generation
     try:
         listeners = await count_listeners(chat_id)
+        if not state.is_current(chat_id, generation):
+            return False
         if listeners == 0:
             logger.info(f"[autoleave_vc] No listeners detected in chat {chat_id}. Leaving voice chat immediately.")
             call_py = get_call_client(chat_id)
             if call_py:
                 try:
-                    await call_py.leave_call(chat_id)
+                    if not await _leave_current_call(call_py, chat_id, generation):
+                        return False
                 except Exception as e:
                     logger.debug(f"[autoleave_vc] leave_call failed for empty chat {chat_id}: {e}")
-            state.queues.pop(chat_id, None)
-            state.playing.pop(chat_id, None)
-            await remove_active_chat(chat_id)
-            await state.delete_now_playing(chat_id)
+            async with state.lock(chat_id):
+                if not state.is_current(chat_id, generation):
+                    return False
+                state.queues.pop(chat_id, None)
+                state.playing.pop(chat_id, None)
+            await remove_active_chat(chat_id, generation=generation)
             bot = clients.get("bot")
             if bot:
                 try:
@@ -858,27 +931,33 @@ async def hd_stream_closed_kicked(client, update):
         return
     # A KICKED update means membership is gone; drop the cached confirmation so
     # the next /play re-runs the join handshake rather than trusting it.
-    state.forget_member(None, chat_id)
-    await remove_active_chat(chat_id)
-    state.queues.pop(chat_id, None)
-    state.playing.pop(chat_id, None)
+    generation = state.generation(chat_id)
+    async with state.lock(chat_id):
+        if not state.is_current(chat_id, generation):
+            return
+        state.forget_member(None, chat_id)
+        state.queues.pop(chat_id, None)
+        state.playing.pop(chat_id, None)
+    await remove_active_chat(chat_id, generation=generation)
 
 
 
 
-async def join_call(message, title, youtube_link, chat, by, duration, mode, thumb, stream_url=None, yt_task=None, queue_msg=None, assistant_num=None):
+async def join_call(message, title, youtube_link, chat, by, duration, mode, thumb, stream_url=None, yt_task=None, queue_msg=None, assistant_num=None, generation=None):
     """Join voice call and start streaming"""
     original_title = title
     title = trim_title(title)
     if chat is None and hasattr(message, "chat") and hasattr(message.chat, "id"):
         chat = message.chat
     chat_id = getattr(chat, "id", chat) if chat is not None else getattr(getattr(message, "chat", None), "id", None)
+    generation = state.generation(chat_id) if generation is None else generation
+    if not state.is_current(chat_id, generation):
+        return
     logger.debug(f"[join_call] Title trimmed from: {original_title} -> {title}")
     logger.info(f"[join_call] Starting join_call for chat {chat_id} (Title: {title}, Mode: {mode})")
 
     try:
         ui_chat_id = message.chat.id if (message and hasattr(message, 'chat') and message.chat) else chat_id
-        audio_flags = MediaStream.Flags.IGNORE if mode == "audio" else None
 
         # Clean up old messages: delete previous track's now-playing card and this track's queue card
         await state.delete_now_playing(chat_id)
@@ -893,10 +972,22 @@ async def join_call(message, title, youtube_link, chat, by, duration, mode, thum
             except Exception as e:
                 logger.debug(f"[join_call] Deleting the command message failed in chat {chat_id}: {e}")
 
+        if not state.is_current(chat_id, generation):
+            return
+
         # ── Wait for YouTube task if we have no stream source or incomplete metadata ──
         # ponytail: await the task we depend on (up to 30s) instead of proceeding sourceless
         # or with placeholder duration/title.
         # shield so a timeout here never cancels the task the queue also holds.
+        # Playlist providers can queue search queries. Resolve those lazily when
+        # claimed for playback, rather than passing search text to FFmpeg.
+        search_query = bool(
+            youtube_link and not os.path.exists(youtube_link)
+            and not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", youtube_link)
+        )
+        if search_query and not yt_task:
+            yt_task = asyncio.create_task(handle_youtube(youtube_link, mode=mode))
+            yt_task.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
         if (not stream_url or duration in (None, "N/A", "00:00", "") or title in ("Suggested Track", "Unknown Media", "Playlist track")) and yt_task:
             logger.info("[join_call] Awaiting YouTube task for stream and metadata (max 30s)...")
             result = None
@@ -906,6 +997,11 @@ async def join_call(message, title, youtube_link, chat, by, duration, mode, thum
                 logger.warning("[join_call] YouTube task not done after 30s — proceeding with available source")
             except Exception as e:
                 logger.warning(f"[join_call] yt_task failed: {e}")
+
+            if not state.is_current(chat_id, generation):
+                return
+            if search_query and (not result or not result[2] or result[2] == "N/A"):
+                raise ValueError("Could not resolve the queued track search")
 
             if result:
                 try:
@@ -947,17 +1043,14 @@ async def join_call(message, title, youtube_link, chat, by, duration, mode, thum
         if stream_url:
             stream_source = stream_url
             logger.info(f"[DIRECT URL] Using provided stream URL: {stream_source}")
-            print(f"[DIRECT URL] Using provided stream URL: {stream_source}", flush=True)
         elif youtube_link:
             logger.info(f"[join_call] Extracting stream URL from YouTube link: {youtube_link} (mode={mode})")
-            print(f"[PLAY] Extracting stream URL from YouTube link: {youtube_link} (mode={mode})", flush=True)
             stream_source = await get_stream_url(youtube_link, mode=mode)
             if not stream_source:
                 logger.warning("[join_call] Failed to extract stream URL, falling back to youtube_link")
                 stream_source = youtube_link
             else:
                 logger.info(f"[DIRECT URL] Successfully extracted stream URL: {stream_source}")
-                print(f"[DIRECT URL] Successfully extracted stream URL: {stream_source}", flush=True)
         else:
             logger.warning("[join_call] No stream_url or youtube_link provided")
             stream_source = None
@@ -970,11 +1063,13 @@ async def join_call(message, title, youtube_link, chat, by, duration, mode, thum
                 if title and ("exceeds" in title.lower() or "limit" in title.lower() or "error" in title.lower()):
                     err_text = f"<b>{title}</b>"
                 await rich_send(clients["bot"], ui_chat_id, rich_note(err_text))
-            return await remove_active_chat(chat_id)
+            return await remove_active_chat(chat_id, generation=generation)
 
         # Resolve the active assistant and PyTgCalls instance
         if assistant_num is None:
-            ast_num, _userbot, call_py = await get_assistant(chat_id)
+            ast_num, _userbot, call_py = await get_assistant(chat_id, generation=generation)
+            if not state.is_current(chat_id, generation):
+                return
         else:
             ast_num = int(assistant_num)
             call_py = calls.get(ast_num, clients.get("call_py"))
@@ -983,145 +1078,145 @@ async def join_call(message, title, youtube_link, chat, by, duration, mode, thum
             call_py = clients.get("call_py")
 
         logger.info(f"[PLAYING DIRECT URL] Attempting to play: {title} via Assistant {ast_num} from {stream_source} in chat {chat_id}")
-        print(f"[PLAYING DIRECT URL] Assistant {ast_num} -> {stream_source}", flush=True)
-        logger.debug(f"[join_call] Calling call_py.play (Assistant {ast_num}); audio_flags={audio_flags}")
+        logger.debug("[join_call] Calling call_py.play (Assistant %s), mode=%s", ast_num, mode)
 
-        _jc_t0 = time.perf_counter()
-        try:
-            await call_py.play(
-                chat_id,
-                MediaStream(
-                    stream_source,
-                    AudioQuality.STUDIO,
-                    VideoQuality.HD_720p,
-                    video_flags=audio_flags,
-                ),
-            )
-        except Exception as play_err:
-            play_err_str = str(play_err).lower()
-            is_gc_err = (
-                isinstance(play_err, NoActiveGroupCall)
-                or any(k in play_err_str for k in (
-                    "noactivegroupcall",
-                    "no active group call",
-                    "groupcall_create_failed",
-                    "groupcall_invalid",
-                    "groupcall_already_discarded",
-                ))
-            )
-            is_timeout_err = (
-                isinstance(play_err, (asyncio.TimeoutError, TimeoutError))
-                or "timeouterror" in play_err_str
-                or "timed out" in play_err_str
-            )
-            retried = False
-            if is_gc_err:
-                _userbot_client = assistants.get(ast_num) or clients.get("session")
-                if _userbot_client:
+        async with state.playback_lock(chat_id):
+            if not state.is_current(chat_id, generation):
+                return
+
+            async def play_current_stream():
+                stream = await make_media_stream(stream_source, mode)
+                if not state.is_current(chat_id, generation):
+                    return False
+                await call_py.play(chat_id, stream)
+                return True
+
+            _jc_t0 = time.perf_counter()
+            try:
+                stream = await make_media_stream(stream_source, mode)
+                if not state.is_current(chat_id, generation):
+                    return
+                await call_py.play(
+                    chat_id,
+                    stream,
+                )
+            except Exception as play_err:
+                if not state.is_current(chat_id, generation):
+                    return
+                play_err_str = str(play_err).lower()
+                is_gc_err = (
+                    isinstance(play_err, NoActiveGroupCall)
+                    or any(k in play_err_str for k in (
+                        "noactivegroupcall",
+                        "no active group call",
+                        "groupcall_create_failed",
+                        "groupcall_invalid",
+                        "groupcall_already_discarded",
+                    ))
+                )
+                is_timeout_err = (
+                    isinstance(play_err, (asyncio.TimeoutError, TimeoutError))
+                    or "timeouterror" in play_err_str
+                    or "timed out" in play_err_str
+                )
+                retried = False
+                if is_gc_err:
+                    _userbot_client = assistants.get(ast_num) or clients.get("session")
+                    if _userbot_client:
+                        try:
+                            from pyrogram.raw.functions.phone import CreateGroupCall
+                            import random
+                            peer = await _userbot_client.resolve_peer(chat_id)
+                            if not state.is_current(chat_id, generation):
+                                return
+                            await _userbot_client.invoke(CreateGroupCall(peer=peer, random_id=random.randint(10000, 99999999)))
+                            if not state.is_current(chat_id, generation):
+                                return
+                            logger.info(f"[join_call] Auto-started voice chat in {chat_id} via assistant {ast_num}")
+                            await asyncio.sleep(1.5)
+                            if not await play_current_stream():
+                                return
+                            retried = True
+                        except Exception as create_err:
+                            logger.debug(f"[join_call] Auto-starting voice chat failed in {chat_id}: {create_err}")
+                elif is_timeout_err and youtube_link:
+                    logger.warning(f"[join_call] Playback stream timed out for {youtube_link}; re-extracting a direct stream URL (bypassing resolver proxy)")
+                    evict_stream_cache(youtube_link, mode=mode)
                     try:
-                        from pyrogram.raw.functions.phone import CreateGroupCall
-                        import random
-                        peer = await _userbot_client.resolve_peer(chat_id)
-                        await _userbot_client.invoke(CreateGroupCall(peer=peer, random_id=random.randint(10000, 99999999)))
-                        logger.info(f"[join_call] Auto-started voice chat in {chat_id} via assistant {ast_num}")
-                        await asyncio.sleep(1.5)
-                        await call_py.play(
-                            chat_id,
-                            MediaStream(
-                                stream_source,
-                                AudioQuality.STUDIO,
-                                VideoQuality.HD_720p,
-                                video_flags=audio_flags,
-                            ),
-                        )
+                        # skip_api so we route around the (slow/unreachable) ytube resolver
+                        # proxy that just timed out and get a direct Innertube/yt-dlp URL.
+                        fresh_stream = await get_stream_url(youtube_link, mode=mode, skip_api=True)
+                        if fresh_stream:
+                            stream_source = fresh_stream
+                            logger.info(f"[RETRY PLAYING DIRECT URL] Retrying play with fresh stream URL for chat {chat_id}: {stream_source}")
+                            if not await play_current_stream():
+                                return
+                            retried = True
+                    except Exception as retry_err:
+                        logger.warning(f"[join_call] Retry play with fresh stream URL failed in {chat_id}: {retry_err}")
+                elif is_timeout_err:
+                    # No youtube_link to re-extract from (pure direct URL). A connection
+                    # timeout is often transient — retry the same source once.
+                    logger.warning(f"[join_call] Playback stream timed out for direct source in {chat_id}; retrying once")
+                    try:
+                        if not await play_current_stream():
+                            return
                         retried = True
-                    except Exception as create_err:
-                        logger.debug(f"[join_call] Auto-starting voice chat failed in {chat_id}: {create_err}")
-            elif is_timeout_err and youtube_link:
-                logger.warning(f"[join_call] Playback stream timed out for {youtube_link}; re-extracting a direct stream URL (bypassing resolver proxy)")
-                evict_stream_cache(youtube_link, mode=mode)
-                try:
-                    # skip_api so we route around the (slow/unreachable) ytube resolver
-                    # proxy that just timed out and get a direct Innertube/yt-dlp URL.
-                    fresh_stream = await get_stream_url(youtube_link, mode=mode, skip_api=True)
-                    if fresh_stream:
-                        stream_source = fresh_stream
-                        logger.info(f"[RETRY PLAYING DIRECT URL] Retrying play with fresh stream URL for chat {chat_id}: {stream_source}")
-                        print(f"[RETRY PLAYING DIRECT URL] Assistant {ast_num} retrying -> {stream_source}", flush=True)
-                        await call_py.play(
-                            chat_id,
-                            MediaStream(
-                                stream_source,
-                                AudioQuality.STUDIO,
-                                VideoQuality.HD_720p,
-                                video_flags=audio_flags,
-                            ),
-                        )
-                        retried = True
-                except Exception as retry_err:
-                    logger.warning(f"[join_call] Retry play with fresh stream URL failed in {chat_id}: {retry_err}")
-            elif is_timeout_err:
-                # No youtube_link to re-extract from (pure direct URL). A connection
-                # timeout is often transient — retry the same source once.
-                logger.warning(f"[join_call] Playback stream timed out for direct source in {chat_id}; retrying once")
-                try:
-                    await call_py.play(
-                        chat_id,
-                        MediaStream(
-                            stream_source,
-                            AudioQuality.STUDIO,
-                            VideoQuality.HD_720p,
-                            video_flags=audio_flags,
-                        ),
-                    )
-                    retried = True
-                except Exception as retry_err:
-                    logger.warning(f"[join_call] Direct-source retry failed in {chat_id}: {retry_err}")
+                    except Exception as retry_err:
+                        logger.warning(f"[join_call] Direct-source retry failed in {chat_id}: {retry_err}")
 
-            if not retried:
-                raise play_err
+                if not retried:
+                    raise play_err
 
-        _jc_call_ms = (time.perf_counter() - _jc_t0) * 1000
-        logger.info(f"[join_call] ⏱ call_py.play() took {_jc_call_ms:.1f}ms for chat {chat_id} (Assistant {ast_num})")
+            _jc_call_ms = (time.perf_counter() - _jc_t0) * 1000
+            logger.info(f"[join_call] ⏱ call_py.play() took {_jc_call_ms:.1f}ms for chat {chat_id} (Assistant {ast_num})")
 
-        try:
-            await call_py.resume(chat_id)
-        except Exception:
-            pass
+            if not state.is_current(chat_id, generation):
+                return
+            try:
+                await call_py.resume(chat_id)
+            except Exception:
+                pass
 
 
-        # Mark chat active with this assistant
-        await state.activate(chat_id, assistant_num=ast_num)
+            if not state.is_current(chat_id, generation):
+                return
 
-        logger.debug(f"[join_call] Updating playing status for chat {chat_id}")
-        state.playing[chat_id] = {
-            "message": message,
-            "title": title,
-            "yt_link": youtube_link,
-            "stream_url": stream_source,
-            "chat": chat,
-            "by": by,
-            "duration": duration,
-            "mode": mode,
-            "thumb": thumb,
-            "assistant_num": ast_num,
-            "ui_chat_id": ui_chat_id,
-        }
-        state.paused_at.pop(chat_id, None)
-        state.played[chat_id] = int(time.time())
-        state.last_played[chat_id] = state.playing[chat_id]
-        # Persist alongside the in-memory value: the auto-leave sweep needs to
-        # tell "idle" from "unknown" after a restart, and state.played is
-        # process-local. Fire-and-forget so playback never waits on Mongo.
-        #
-        # This is also the only place a song start is recorded for /stats:
-        # set_last_played bumps play_count and appends to play_dates, which every
-        # /stats figure (24h / Week / Overall, per group and bot-wide) is derived
-        # from. A second bot-wide `collection.dates` array used to be pushed here
-        # for the windowed views only; two sources for the same number is how the
-        # periods ended up disagreeing, so it is gone.
-        db_task(db_set_last_played(chat_id, state.played[chat_id]))
-        logger.debug(f"[join_call] Playing status updated, timestamp: {state.played[chat_id]}")
+            # Mark chat active with this assistant
+            await state.activate(chat_id, assistant_num=ast_num, generation=generation)
+            if not state.is_current(chat_id, generation):
+                return
+
+            logger.debug(f"[join_call] Updating playing status for chat {chat_id}")
+            state.playing[chat_id] = {
+                "message": message,
+                "title": title,
+                "yt_link": youtube_link,
+                "stream_url": stream_source,
+                "chat": chat,
+                "by": by,
+                "duration": duration,
+                "mode": mode,
+                "thumb": thumb,
+                "assistant_num": ast_num,
+                "ui_chat_id": ui_chat_id,
+                "_generation": generation,
+            }
+            state.paused_at.pop(chat_id, None)
+            state.played[chat_id] = int(time.time())
+            state.last_played[chat_id] = state.playing[chat_id]
+            # Persist alongside the in-memory value: the auto-leave sweep needs to
+            # tell "idle" from "unknown" after a restart, and state.played is
+            # process-local. Fire-and-forget so playback never waits on Mongo.
+            #
+            # This is also the only place a song start is recorded for /stats:
+            # set_last_played bumps play_count and appends to play_dates, which every
+            # /stats figure (24h / Week / Overall, per group and bot-wide) is derived
+            # from. A second bot-wide `collection.dates` array used to be pushed here
+            # for the windowed views only; two sources for the same number is how the
+            # periods ended up disagreeing, so it is gone.
+            db_task(db_set_last_played(chat_id, state.played[chat_id]))
+            logger.debug(f"[join_call] Playing status updated, timestamp: {state.played[chat_id]}")
 
         logger.debug("[join_call] Creating inline keyboard for playback controls")
         is_channel = (ui_chat_id != chat_id) or (getattr(chat, 'type', None) in (ChatType.CHANNEL, "ChatType.CHANNEL"))
@@ -1283,6 +1378,8 @@ async def join_call(message, title, youtube_link, chat, by, duration, mode, thum
             },
         ])
 
+        if not state.is_current(chat_id, generation):
+            return
         logger.debug(f"[join_call] Sending now playing message to ui_chat_id {ui_chat_id}")
         sent_message = None
 
@@ -1299,6 +1396,13 @@ async def join_call(message, title, youtube_link, chat, by, duration, mode, thum
                     clients["bot"], ui_chat_id, text, reply_markup=keyboard
                 )
 
+        if not state.is_current(chat_id, generation):
+            if sent_message:
+                try:
+                    await sent_message.delete()
+                except Exception:
+                    pass
+            return
         if sent_message:
             state.set_now_playing(chat_id, sent_message)
 
@@ -1310,22 +1414,30 @@ async def join_call(message, title, youtube_link, chat, by, duration, mode, thum
 
     except NoActiveGroupCall:
         logger.warning(f"[join_call] No active voice chat in {chat_id}. Cleaning up.")
+        if not state.is_current(chat_id, generation):
+            return
         state.forget_member(None, chat_id)
-        await remove_active_chat(chat_id)
-        state.queues.pop(chat_id, None)
-        state.playing.pop(chat_id, None)
-        await state.delete_now_playing(chat_id)
+        async with state.lock(chat_id):
+            if not state.is_current(chat_id, generation):
+                return
+            state.queues.pop(chat_id, None)
+            state.playing.pop(chat_id, None)
+        await remove_active_chat(chat_id, generation=generation)
         if "bot" in clients and clients["bot"]:
             is_channel = (ui_chat_id != chat_id) or (getattr(chat, 'type', None) in (ChatType.CHANNEL, "ChatType.CHANNEL"))
             msg = Messages.NO_ACTIVE_VC_CHANNEL if is_channel else Messages.NO_ACTIVE_VC
             await rich_send(clients["bot"], ui_chat_id, rich_note(msg))
     except Exception as e:
         err_str = str(e).lower()
+        if not state.is_current(chat_id, generation):
+            return
         state.forget_member(None, chat_id)
-        await remove_active_chat(chat_id)
-        state.queues.pop(chat_id, None)
-        state.playing.pop(chat_id, None)
-        await state.delete_now_playing(chat_id)
+        async with state.lock(chat_id):
+            if not state.is_current(chat_id, generation):
+                return
+            state.queues.pop(chat_id, None)
+            state.playing.pop(chat_id, None)
+        await remove_active_chat(chat_id, generation=generation)
 
         is_channel = (ui_chat_id != chat_id) or (getattr(chat, 'type', None) in (ChatType.CHANNEL, "ChatType.CHANNEL"))
         is_groupcall_error = (
@@ -1365,7 +1477,33 @@ async def join_call(message, title, youtube_link, chat, by, duration, mode, thum
                     await rich_send(clients["bot"], ui_chat_id, rich_note(Messages.ERROR_OCCURRED))
 
 
-async def _trigger_suggestions(client, chat_id: int, last_song: dict):
+async def _leave_current_call(call_py, chat_id, generation):
+    async with state.playback_lock(chat_id):
+        if not state.is_current(chat_id, generation):
+            return False
+        await call_py.leave_call(chat_id)
+        return True
+
+
+async def _trigger_suggestions(client, chat_id: int, last_song: dict, *, generation=None):
+    generation = state.generation(chat_id) if generation is None else generation
+    if not state.is_current(chat_id, generation):
+        return
+    task = asyncio.current_task()
+    previous = state.suggest_tasks.get(chat_id)
+    if previous is not task:
+        state.cancel_suggest(chat_id)
+    state.suggest_tasks[chat_id] = task
+    try:
+        await _suggestion_workflow(client, chat_id, last_song, generation)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        if state.suggest_tasks.get(chat_id) is task:
+            state.suggest_tasks.pop(chat_id, None)
+
+
+async def _suggestion_workflow(client, chat_id: int, last_song: dict, generation):
     """
     Called when a chat's queue is empty and playback has ended.
     Fetches suggestions related to the last played track and posts an interactive
@@ -1373,12 +1511,17 @@ async def _trigger_suggestions(client, chat_id: int, last_song: dict):
     """
     call_py = get_call_client(chat_id) or (client if hasattr(client, "leave_call") else clients.get("call_py"))
     try:
-        if call_py:
-            try:
-                await call_py.pause(chat_id)
-            except Exception:
-                pass
+        async with state.playback_lock(chat_id):
+            if not state.is_current(chat_id, generation):
+                return
+            if call_py:
+                try:
+                    await call_py.pause(chat_id)
+                except Exception:
+                    pass
 
+        if not state.is_current(chat_id, generation):
+            return
         last_vid = None
         yt_link = last_song.get("yt_link", "")
 
@@ -1392,26 +1535,30 @@ async def _trigger_suggestions(client, chat_id: int, last_song: dict):
             await state.delete_now_playing(chat_id)
             if call_py:
                 try:
-                    await call_py.leave_call(chat_id)
+                    await _leave_current_call(call_py, chat_id, generation)
                 except Exception:
                     pass
-            await remove_active_chat(chat_id)
+            await remove_active_chat(chat_id, generation=generation)
             return
 
         exclude_ids = state.get_history_ids(chat_id)
         exclude_ids.add(last_vid)
 
-        suggestions = await get_related_suggestions(last_vid, exclude_ids=exclude_ids, limit=5)
+        suggestions = await get_related_suggestions(
+            last_vid, exclude_ids=exclude_ids, limit=5, seed_title=last_song.get("title"),
+        )
+        if not state.is_current(chat_id, generation):
+            return
 
         if not suggestions:
             logger.info(f"[Suggest] No related suggestions found for {last_vid} in chat {chat_id}; leaving call.")
             await state.delete_now_playing(chat_id)
             if call_py:
                 try:
-                    await call_py.leave_call(chat_id)
+                    await _leave_current_call(call_py, chat_id, generation)
                 except Exception:
                     pass
-            await remove_active_chat(chat_id)
+            await remove_active_chat(chat_id, generation=generation)
             return
 
         for s in suggestions:
@@ -1424,10 +1571,10 @@ async def _trigger_suggestions(client, chat_id: int, last_song: dict):
             logger.warning("[Suggest] Bot client not available")
             if call_py:
                 try:
-                    await call_py.leave_call(chat_id)
+                    await _leave_current_call(call_py, chat_id, generation)
                 except Exception:
                     pass
-            await remove_active_chat(chat_id)
+            await remove_active_chat(chat_id, generation=generation)
             return
 
         countdown_sec = 10
@@ -1441,8 +1588,8 @@ async def _trigger_suggestions(client, chat_id: int, last_song: dict):
             ui_chat_id = last_song.get("ui_chat_id")
         elif last_msg and hasattr(last_msg, "chat") and last_msg.chat:
             ui_chat_id = last_msg.chat.id
-        elif chat_id in state.now_playing and state.now_playing[chat_id]:
-            np = state.now_playing[chat_id]
+        elif state.get_now_playing(chat_id):
+            np = state.get_now_playing(chat_id)
             if hasattr(np, "chat") and np.chat:
                 ui_chat_id = np.chat.id
 
@@ -1550,6 +1697,8 @@ async def _trigger_suggestions(client, chat_id: int, last_song: dict):
 
         keyboard = Buttons.suggestion_markup(suggestions[:5], autoplay_enabled=autoplay_enabled, channel_mode=is_channel)
 
+        if not state.is_current(chat_id, generation):
+            return
         sent_msg = await rich_send_blocks(
             bot,
             ui_chat_id,
@@ -1571,16 +1720,20 @@ async def _trigger_suggestions(client, chat_id: int, last_song: dict):
                 reply_markup=keyboard,
             )
 
-        if not autoplay_enabled:
+        if not state.is_current(chat_id, generation) or not autoplay_enabled:
             return
 
         async def _suggest_countdown():
             try:
                 await asyncio.sleep(countdown_sec)
+                if not state.is_current(chat_id, generation):
+                    return
                 # Quick recheck: if everyone left during countdown, cancel and leave immediately
-                if await autoleave_vc(chat_id):
+                if await autoleave_vc(chat_id, generation=generation):
                     return
 
+                if not state.is_current(chat_id, generation):
+                    return
                 top_track = suggestions[0]
                 top_vid = top_track.get("video_id")
                 top_url = top_track.get("url") or f"https://www.youtube.com/watch?v={top_vid}"
@@ -1601,7 +1754,7 @@ async def _trigger_suggestions(client, chat_id: int, last_song: dict):
                     except Exception as e:
                         logger.debug(f"[Suggest] Editing the suggestion card to the autoplay notice failed for chat {chat_id}: {e}")
 
-                yt_task = asyncio.create_task(handle_youtube(top_url))
+                yt_task = asyncio.create_task(handle_youtube(top_url, mode="audio"))
                 yt_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
 
                 by_user = "AUTO"
@@ -1620,6 +1773,7 @@ async def _trigger_suggestions(client, chat_id: int, last_song: dict):
                     stream_url=None,
                     yt_task=yt_task,
                     assistant_num=ast_num,
+                    generation=generation,
                 )
             except asyncio.CancelledError:
                 logger.debug(f"[Suggest] Countdown autoplay cancelled for chat {chat_id}")
@@ -1627,22 +1781,20 @@ async def _trigger_suggestions(client, chat_id: int, last_song: dict):
                 logger.warning(f"[Suggest] Countdown autoplay failed for chat {chat_id}: {err}")
                 if call_py:
                     try:
-                        await call_py.leave_call(chat_id)
+                        await _leave_current_call(call_py, chat_id, generation)
                     except Exception:
                         pass
-                await remove_active_chat(chat_id)
-            finally:
-                state.suggest_tasks.pop(chat_id, None)
-
-        task = asyncio.create_task(_suggest_countdown())
-        state.suggest_tasks[chat_id] = task
+                await remove_active_chat(chat_id, generation=generation)
+        await _suggest_countdown()
 
     except Exception as e:
+        if not state.is_current(chat_id, generation):
+            return
         logger.warning(f"[Suggest] Error triggering suggestions for chat {chat_id}: {e}")
         try:
             if call_py:
-                await call_py.leave_call(chat_id)
-            await remove_active_chat(chat_id)
+                await _leave_current_call(call_py, chat_id, generation)
+            await remove_active_chat(chat_id, generation=generation)
         except Exception as cleanup_err:
             logger.debug(f"[Suggest] Cleanup after the suggestion failure failed for chat {chat_id}: {cleanup_err}")
 
@@ -1657,6 +1809,9 @@ async def end(client, update):
     # with the per-chat `play_count` that /stats shows on the same card.
     try:
         chat_id = update.chat_id
+        generation = state.generation(chat_id)
+        if chat_id not in state.active:
+            return
         state.cancel_suggest(chat_id)
 
         # Hold the chat lock only for the queue read-modify-write. join_call and
@@ -1665,10 +1820,17 @@ async def end(client, update):
         # deadlocks the stream_end handler and, because the lock is never
         # released, every later command for this chat.
         async with state.lock(chat_id):
+            if not state.is_current(chat_id, generation) or chat_id not in state.active:
+                return
             next_song = state.queues[chat_id].pop(0) if state.queues.get(chat_id) else None
             if next_song:
                 state.playing[chat_id] = next_song
                 state.last_played[chat_id] = next_song
+                last_song = None
+            else:
+                last_song = state.playing.pop(chat_id, None) or state.last_played.get(chat_id)
+                if last_song:
+                    state.last_played[chat_id] = last_song
 
         if next_song:
             ast_num = state.get_chat_assistant(chat_id)
@@ -1685,19 +1847,16 @@ async def end(client, update):
                 yt_task=next_song.get('_yt_task'),
                 queue_msg=next_song.get('queue_msg'),
                 assistant_num=ast_num,
+                generation=generation,
             )
         else:
             logger.info(f"Song queue for chat {chat_id} is empty.")
-            last_song = state.playing.pop(chat_id, None) or state.last_played.get(chat_id)
             if last_song:
-                state.last_played[chat_id] = last_song
-
-            if last_song:
-                asyncio.create_task(_trigger_suggestions(client, chat_id, last_song))
+                asyncio.create_task(_trigger_suggestions(client, chat_id, last_song, generation=generation))
             else:
                 await state.delete_now_playing(chat_id)
-                await client.leave_call(chat_id)
-                await remove_active_chat(chat_id)
+                await _leave_current_call(client, chat_id, generation)
+                await remove_active_chat(chat_id, generation=generation)
     except Exception as e:
         logger.warning(f"Error in end function: {e}")
 

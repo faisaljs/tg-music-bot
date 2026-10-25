@@ -14,6 +14,41 @@ def _transport_card(headline: str, pairs) -> str:
     return headline + rich_kv_table(pairs)
 
 
+async def _stop_playback(client, chat_id, active_cp, *, generation=None):
+    """Invalidate pending work before waiting for an in-flight player call."""
+    if generation is not None and not state.is_current(chat_id, generation):
+        return
+    generation = state.invalidate(chat_id)
+    if not await remove_active_chat(client, chat_id, generation=generation, clear_queue=True):
+        return
+    async with state.playback_lock(chat_id):
+        current_song = state.playing.get(chat_id)
+        if current_song and current_song.get("_generation") is not None:
+            return
+        if active_cp:
+            try:
+                await active_cp.leave_call(chat_id)
+            except NotInCallError:
+                pass
+
+
+async def _pause_current_call(active_cp, chat_id, generation):
+    async with state.playback_lock(chat_id):
+        if not state.is_current(chat_id, generation):
+            return False
+        if active_cp:
+            await active_cp.pause(chat_id)
+        return state.is_current(chat_id, generation)
+
+
+async def _pop_next_queued(chat_id, generation):
+    async with state.lock(chat_id):
+        if not state.is_current(chat_id, generation):
+            return None
+        queue = state.queues.get(chat_id)
+        return queue.pop(0) if queue else None
+
+
 async def _resolve_ctrl_chat_id(client, update, is_channel: bool) -> int:
     """Resolve target chat id for playback controls, mapping group -> linked channel if channel_mode."""
     chat = update.message.chat if isinstance(update, CallbackQuery) else update.chat
@@ -83,6 +118,8 @@ async def seek_handler_func(client, message):
         # Check if there's a song playing
         if chat_id in state.playing and state.playing[chat_id]:
             current_song = state.playing[chat_id]
+            generation = state.generation(chat_id)
+            was_paused = state.is_paused(chat_id)
             duration_str = str(current_song.get('duration', 'N/A'))
 
             # Convert HH:MM:SS to total seconds safely
@@ -107,7 +144,7 @@ async def seek_handler_func(client, message):
                 )
                 return
 
-            played_in_seconds = int(time.time() - state.played[chat_id])
+            played_in_seconds = state.elapsed_playback(chat_id)
 
             # Check seek boundaries based on command
             is_forward = message.command[0].lower() in ("seek", "cseek")
@@ -139,7 +176,6 @@ async def seek_handler_func(client, message):
 
             # Set audio flags based on mode
             mode = current_song.get('mode', 'audio')
-            audio_flags = MediaStream.Flags.IGNORE if mode == "audio" else None
 
             # Seek to specified position
             to_seek = format_duration(total_seek)
@@ -169,7 +205,7 @@ async def seek_handler_func(client, message):
             # get_stream_url can take seconds (if fallback ran). The track may
             # have ended, been skipped, or been replaced meanwhile -- seeking now
             # would restart the *old* song over whatever is currently playing.
-            if state.playing.get(chat_id) is not current_song:
+            if not state.is_current(chat_id, generation) or state.playing.get(chat_id) is not current_song:
                 logger.info(f"[seek] Track changed in chat {chat_id}; aborting seek")
                 return
 
@@ -193,19 +229,25 @@ async def seek_handler_func(client, message):
                 return
 
             ffmpeg_params = f"-ss {to_seek} -to {duration_str}" if duration_seconds > 0 else f"-ss {to_seek}"
-            logger.info(f"[SEEK PLAYING DIRECT URL] Seeking in chat {chat_id}: {stream_url}")
-            print(f"[SEEK PLAYING DIRECT URL] Seeking in chat {chat_id}: {stream_url}", flush=True)
+            logger.info("[seek] Seeking in chat %s to %s", chat_id, to_seek)
             try:
-                await active_cp.play(
-                    chat_id,
-                    MediaStream(
-                        stream_url,
-                        AudioQuality.STUDIO,
-                        VideoQuality.HD_720p,
-                        video_flags=audio_flags,
-                        ffmpeg_parameters=ffmpeg_params,
-                    ),
-                )
+                media = await make_media_stream(stream_url, mode, ffmpeg_params)
+                async with state.playback_lock(chat_id):
+                    if not state.is_current(chat_id, generation) or state.playing.get(chat_id) is not current_song:
+                        return
+                    await active_cp.play(chat_id, media)
+                    if not state.is_current(chat_id, generation):
+                        return
+                    if was_paused:
+                        await active_cp.pause(chat_id)
+                    if not state.is_current(chat_id, generation):
+                        return
+                    now = time.time()
+                    state.played[chat_id] = now - total_seek
+                    if was_paused:
+                        state.paused_at[chat_id] = now
+                    else:
+                        state.paused_at.pop(chat_id, None)
             except Exception as seek_err:
                 logger.warning(f"[seek] Failed to seek stream in {chat_id}: {seek_err}")
                 await rich_reply(
@@ -215,12 +257,6 @@ async def seek_handler_func(client, message):
                     client=client,
                 )
                 return
-
-            # Update played time based on command
-            if is_forward:
-                state.played[chat_id] -= seek_value
-            else:  # seekback
-                state.played[chat_id] += seek_value
 
             # Public: everyone in the chat hears the jump, so everyone sees why.
             await rich_reply(
@@ -265,20 +301,9 @@ async def button_end_handler(client: Client, callback_query: CallbackQuery):
         chat_id = await _resolve_ctrl_chat_id(client, callback_query, is_channel)
 
         is_active = await is_active_chat(client, chat_id)
-        state.cancel_suggest(chat_id)
         active_cp = get_call_client(chat_id) or clients.get("call_py")
+        await _stop_playback(client, chat_id, active_cp)
         if is_active:
-            # Clear the song queue and end the session
-            await remove_active_chat(client, chat_id)
-            state.queues.pop(chat_id, None)
-            try:
-                if active_cp:
-                    await active_cp.leave_call(chat_id)
-            except Exception as e:
-                logger.warning(f"Error leaving call: {e}")
-
-            state.playing.pop(chat_id, None)
-            await state.delete_now_playing(chat_id)
             try:
                 await rich_edit(callback_query, rich_note(Messages.STREAM_ENDED), reply_markup=None)
             except Exception as e:
@@ -286,16 +311,6 @@ async def button_end_handler(client: Client, callback_query: CallbackQuery):
 
             await callback_query.answer(Messages.STREAM_ENDED, show_alert=False)
         else:
-            await remove_active_chat(client, chat_id)
-            state.queues.pop(chat_id, None)
-            try:
-                if active_cp:
-                    await active_cp.leave_call(chat_id)
-            except Exception as e:
-                logger.warning(f"Error leaving call: {e}")
-
-            state.playing.pop(chat_id, None)
-            await state.delete_now_playing(chat_id)
             try:
                 await rich_edit(callback_query, rich_note(Messages.NO_STREAM), reply_markup=None)
             except Exception as e:
@@ -303,10 +318,6 @@ async def button_end_handler(client: Client, callback_query: CallbackQuery):
 
             await callback_query.answer(Messages.NO_ACTIVE_STREAM, show_alert=False)
     except NotInCallError:
-        await remove_active_chat(client, chat_id)
-        state.queues.pop(chat_id, None)
-        state.playing.pop(chat_id, None)
-        await state.delete_now_playing(chat_id)
         await callback_query.answer(Messages.STREAM_ENDED_NOT_IN_CALL, show_alert=False)
     except Exception as e:
         logger.error(f"Error in end button handler: {e}")
@@ -326,33 +337,19 @@ async def end_handler_func(client, message):
   try:
    is_channel = message.command[0].lower() in ("cend", "cstop")
    chat_id = await _resolve_ctrl_chat_id(client, message, is_channel)
-   state.cancel_suggest(chat_id)
    is_active = await is_active_chat(client, chat_id)
    active_cp = get_call_client(chat_id) or clients.get("call_py")
+   await _stop_playback(client, chat_id, active_cp)
    if is_active:
-        await remove_active_chat(client, chat_id)
-        state.queues.pop(chat_id, None)
         await rich_reply(
             message,
             rich_note(Messages.QUEUE_CLEARED_STOPPED.format(message.from_user.mention())),
             client=client,
         )
-        if active_cp:
-            await active_cp.leave_call(chat_id)
-        state.playing.pop(chat_id, None)
-        await state.delete_now_playing(chat_id)
    else:
         await rich_reply(message, rich_note(Messages.NO_STREAM), ephemeral=True, client=client)
-        await remove_active_chat(client, chat_id)
-        state.queues.pop(chat_id, None)
-        if active_cp:
-            await active_cp.leave_call(chat_id)
-        state.playing.pop(chat_id, None)
-        await state.delete_now_playing(chat_id)
   except NotInCallError:
       await rich_reply(message, rich_note(Messages.NO_STREAM), ephemeral=True, client=client)
-      state.playing.pop(chat_id, None)
-      await state.delete_now_playing(chat_id)
 
 
 @Client.on_callback_query(filters.regex(r"^(skip|cskip)$"))
@@ -368,14 +365,16 @@ async def button_skip_handler(client: Client, callback_query: CallbackQuery):
         chat_id = await _resolve_ctrl_chat_id(client, callback_query, is_channel)
         active_cp = get_call_client(chat_id) or clients.get("call_py")
 
-        state.cancel_suggest(chat_id)
-        if chat_id in state.queues and len(state.queues[chat_id]) > 0:
+        generation = state.invalidate(chat_id)
+        next_song = await _pop_next_queued(chat_id, generation)
+        if not state.is_current(chat_id, generation):
+            return
+        if next_song:
             # There's a next song in queue
-            next_song = state.queues[chat_id].pop(0)
 
             try:
-                if active_cp:
-                    await active_cp.pause(chat_id)
+                if not await _pause_current_call(active_cp, chat_id, generation):
+                    return
             except Exception as e:
                 logger.warning(f"Could not pause before skip: {e}")
 
@@ -392,6 +391,7 @@ async def button_skip_handler(client: Client, callback_query: CallbackQuery):
                 yt_task=next_song.get('_yt_task'),
                 queue_msg=next_song.get('queue_msg'),
                 assistant_num=state.get_chat_assistant(chat_id),
+                generation=generation,
             )
             await callback_query.answer(Messages.SKIPPED_SUCCESS, show_alert=False)
         else:
@@ -402,25 +402,18 @@ async def button_skip_handler(client: Client, callback_query: CallbackQuery):
                 if last_song:
                     state.last_played[chat_id] = last_song
                     try:
-                        if active_cp:
-                            await active_cp.pause(chat_id)
+                        if not await _pause_current_call(active_cp, chat_id, generation):
+                            return
                     except Exception as e:
                         logger.warning(f"Could not pause before skip: {e}")
                     await callback_query.answer(Messages.SKIPPED_AUTOPLAY, show_alert=False)
+                    if not state.is_current(chat_id, generation):
+                        return
                     await state.delete_now_playing(chat_id)
                     # Fire and forget — trigger_suggestions will send the card and start countdown
-                    asyncio.create_task(trigger_suggestions(active_cp or client, chat_id, last_song))
+                    asyncio.create_task(trigger_suggestions(active_cp or client, chat_id, last_song, generation=generation))
                     return
-            try:
-                if active_cp:
-                    await active_cp.leave_call(chat_id)
-            except Exception as e:
-                logger.warning(f"Error leaving call: {e}")
-
-            await remove_active_chat(client, chat_id)
-            state.queues.pop(chat_id, None)
-            state.playing.pop(chat_id, None)
-            await state.delete_now_playing(chat_id)
+            await _stop_playback(client, chat_id, active_cp, generation=generation)
 
             try:
                 await rich_edit(callback_query, rich_note(Messages.QUEUE_EMPTY_STREAM_ENDED), reply_markup=None)
@@ -430,10 +423,7 @@ async def button_skip_handler(client: Client, callback_query: CallbackQuery):
             await callback_query.answer(Messages.QUEUE_EMPTY_STREAM_ENDED, show_alert=False)
 
     except NotInCallError:
-        await remove_active_chat(client, chat_id)
-        state.queues.pop(chat_id, None)
-        state.playing.pop(chat_id, None)
-        await state.delete_now_playing(chat_id)
+        await _stop_playback(client, chat_id, active_cp, generation=generation)
         await callback_query.answer(Messages.STREAM_ENDED_NOT_IN_CALL, show_alert=False)
     except Exception as e:
         logger.error(f"Error in skip button handler: {e}")
@@ -481,17 +471,21 @@ async def button_playnow_handler(client: Client, callback_query: CallbackQuery):
             await callback_query.answer(Messages.ADMIN_RESTRICTED_ACTION, show_alert=True)
             return
 
+        generation = state.generation(chat_id)
         song = await state.pop_track(chat_id, track_id)
+        if not state.is_current(chat_id, generation):
+            return
         if not song:
             await callback_query.answer(Messages.TRACK_GONE, show_alert=True)
             return
 
+        generation = state.invalidate(chat_id)
         await callback_query.answer(clean_alert(Messages.PLAYING_NOW.format(user.first_name or "User")), show_alert=False)
 
         active_cp = get_call_client(chat_id) or clients.get("call_py")
         try:
-            if active_cp:
-                await active_cp.pause(chat_id)
+            if not await _pause_current_call(active_cp, chat_id, generation):
+                return
         except Exception as e:
             logger.warning(f"Could not pause before play-now: {e}")
 
@@ -508,6 +502,7 @@ async def button_playnow_handler(client: Client, callback_query: CallbackQuery):
             yt_task=song.get('_yt_task'),
             queue_msg=song.get('queue_msg'),
             assistant_num=state.get_chat_assistant(chat_id),
+            generation=generation,
         )
     except Exception as e:
         logger.error(f"Error in play-now button handler: {e}")
@@ -621,9 +616,11 @@ async def skip_handler_func(client, message):
    is_channel = message.command[0].lower() == "cskip"
    chat_id = await _resolve_ctrl_chat_id(client, message, is_channel)
    active_cp = get_call_client(chat_id) or clients.get("call_py")
-   state.cancel_suggest(chat_id)
-   if chat_id in state.queues and len(state.queues[chat_id]) > 0:
-       next = state.queues[chat_id].pop(0)
+   generation = state.invalidate(chat_id)
+   next = await _pop_next_queued(chat_id, generation)
+   if not state.is_current(chat_id, generation):
+       return
+   if next:
        await rich_reply(
            message,
            _transport_card(
@@ -635,10 +632,13 @@ async def skip_handler_func(client, message):
            ),
            client=client,
        )
-       state.playing[chat_id] = next
+       async with state.lock(chat_id):
+           if not state.is_current(chat_id, generation):
+               return
+           state.playing[chat_id] = next
        try:
-          if active_cp:
-              await active_cp.pause(chat_id)
+          if not await _pause_current_call(active_cp, chat_id, generation):
+              return
        except Exception as e:
           logger.debug(f"[skip] Could not pause assistant before skip in {chat_id}: {e}")
        await join_call(
@@ -654,6 +654,7 @@ async def skip_handler_func(client, message):
             yt_task=next.get('_yt_task'),
             queue_msg=next.get('queue_msg'),
             assistant_num=state.get_chat_assistant(chat_id),
+            generation=generation,
         )
    else:
         # No more songs in queue
@@ -663,8 +664,8 @@ async def skip_handler_func(client, message):
             if last_song:
                 state.last_played[chat_id] = last_song
                 try:
-                    if active_cp:
-                        await active_cp.pause(chat_id)
+                    if not await _pause_current_call(active_cp, chat_id, generation):
+                        return
                 except Exception as e:
                     logger.warning(f"Could not pause before skip: {e}")
                 await state.delete_now_playing(chat_id)
@@ -674,15 +675,10 @@ async def skip_handler_func(client, message):
                     client=client,
                 )
                 # Fire and forget — trigger_suggestions will send the card and start countdown
-                asyncio.create_task(trigger_suggestions(active_cp or client, chat_id, last_song))
+                asyncio.create_task(trigger_suggestions(active_cp or client, chat_id, last_song, generation=generation))
                 return
 
-        if active_cp:
-            await active_cp.leave_call(chat_id)
-        await remove_active_chat(client, chat_id)
-        state.queues.pop(chat_id, None)
-        state.playing.pop(chat_id, None)
-        await state.delete_now_playing(chat_id)
+        await _stop_playback(client, chat_id, active_cp, generation=generation)
         await rich_reply(
             message,
             rich_note(Messages.SKIPPED_EMPTY.format(message.from_user.mention())),
@@ -690,8 +686,7 @@ async def skip_handler_func(client, message):
         )
   except NotInCallError:
       await rich_reply(message, rich_note(Messages.NO_STREAM), ephemeral=True, client=client)
-      state.playing.pop(chat_id, None)
-      await state.delete_now_playing(chat_id)
+      await _stop_playback(client, chat_id, active_cp, generation=generation)
 
 
 @Client.on_callback_query(filters.regex("^(resume|cresume)$"))
@@ -802,8 +797,7 @@ async def suggestion_play_handler(client: Client, callback_query: CallbackQuery)
     vid = callback_query.data.split("sgplay_", 1)[1]
     url = f"https://www.youtube.com/watch?v={vid}"
 
-    # Cancel countdown timer
-    state.cancel_suggest(chat_id)
+    generation = state.invalidate(chat_id)
 
     await callback_query.answer(Messages.STARTING_PLAYBACK, show_alert=False)
 
@@ -817,8 +811,10 @@ async def suggestion_play_handler(client: Client, callback_query: CallbackQuery)
         logger.debug(f"[Suggest] Failed to edit suggestion card for {vid} in {chat_id}: {e}")
 
     try:
+        if not state.is_current(chat_id, generation):
+            return
         state.add_to_history(chat_id, vid)
-        yt_task = asyncio.create_task(handle_youtube(url))
+        yt_task = asyncio.create_task(handle_youtube(url, mode="audio"))
         yt_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
 
         last_info = state.last_played.get(chat_id) or {}
@@ -835,6 +831,7 @@ async def suggestion_play_handler(client: Client, callback_query: CallbackQuery)
             stream_url=None,
             yt_task=yt_task,
             assistant_num=state.get_chat_assistant(chat_id),
+            generation=generation,
         )
     except Exception as e:
         logger.error(f"[Suggest] Failed to play suggested track {vid}: {e}")
@@ -853,19 +850,12 @@ async def suggestion_stop_handler(client: Client, callback_query: CallbackQuery)
 
     is_channel = callback_query.data == "csgstop"
     chat_id = await _resolve_ctrl_chat_id(client, callback_query, is_channel)
-    state.cancel_suggest(chat_id)
     active_cp = get_call_client(chat_id) or clients.get("call_py")
 
     try:
-        if active_cp:
-            await active_cp.leave_call(chat_id)
+        await _stop_playback(client, chat_id, active_cp)
     except Exception as e:
         logger.debug(f"[Suggest] Failed to leave call in {chat_id}: {e}")
-
-    await remove_active_chat(client, chat_id)
-    state.queues.pop(chat_id, None)
-    state.playing.pop(chat_id, None)
-    await state.delete_now_playing(chat_id)
 
     try:
         await rich_edit(
